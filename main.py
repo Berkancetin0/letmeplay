@@ -1,1160 +1,1327 @@
 """
-Spotify Mini Player — Windows Overlay
-Oyunun üzerinde duran, küçültülebilir müzik kontrolü.
+Let Me Play  v3.0  —  Gaming Music Overlay
+Spotify green theme · optimised · in-game hotkeys
 """
 
-import sys
-import json
-import time
-import base64
-import random
-import threading
-import webbrowser
-import urllib.parse
-import http.server
+import sys, json, time, base64, random, struct, zlib, math
+import threading, webbrowser, urllib.parse, http.server
 from pathlib import Path
 
 import requests
+
 try:
-    from pynput import keyboard as pynput_kb
-    HAS_PYNPUT = True
+    from pynput import keyboard as _kb
+    HAS_HK = True
 except ImportError:
-    HAS_PYNPUT = False
+    HAS_HK = False
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QSlider,
     QHBoxLayout, QVBoxLayout, QLineEdit, QFrame,
-    QGraphicsDropShadowEffect, QSpinBox
+    QGraphicsDropShadowEffect, QSpinBox,
 )
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QRect
-from PyQt6.QtGui import (
+from PyQt6.QtCore  import Qt, QTimer, QThread, pyqtSignal, QPoint, QRect
+from PyQt6.QtGui   import (
     QPixmap, QImage, QPainter, QColor, QPainterPath,
-    QBrush, QPen, QIcon, QCursor, QFont
+    QBrush, QPen, QIcon, QCursor, QFont,
+    QLinearGradient, QRadialGradient,
 )
 
-# ─────────────────────────────────────────────
-#  CONFIG / PERSISTENCE
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+#  PALETTE  — Spotify green / dark
+# ═══════════════════════════════════════════════
+G = "#1ed760"          # Spotify green
+G2 = "#17aa4a"         # darker green (pressed)
+G_DIM = "rgba(30,215,96,0.18)"
+G_GLOW = "rgba(30,215,96,0.28)"
+
+BG      = "#080c0a"    # near-black with green tint
+CARD    = "#0e1410"    # card surface
+CARD2   = "#151d18"    # raised surface
+BORDER  = "rgba(255,255,255,0.07)"
+BORDER_G= "rgba(30,215,96,0.30)"
+TEXT    = "#e8f5e9"    # near-white green tint
+TEXT_DIM= "rgba(232,245,233,0.50)"
+TEXT_MUT= "rgba(232,245,233,0.25)"
+DANGER  = "#ef4444"
+
+# ═══════════════════════════════════════════════
+#  CONSTANTS
+# ═══════════════════════════════════════════════
+APP     = "Let Me Play"
+VER     = "3.0"
+BASE_W  = 300
+ART_SZ  = 42
+PORT    = 8888
+
+AUTH_F  = Path.home() / ".lmp_auth.json"
+CFG_F   = Path.home() / ".lmp_cfg.json"
+
+DEFAULT_CFG = {
+    "x": -1, "y": -1,
+    "opacity": 94,
+    "scale":   100,
+    "hk_play":     "<ctrl>+<shift>+p",
+    "hk_next":     "<ctrl>+<shift>+n",
+    "hk_prev":     "<ctrl>+<shift>+b",
+    "hk_collapse": "<ctrl>+<shift>+m",
+    "hk_settings": "<ctrl>+<shift>+s",
+}
+
+def load_cfg() -> dict:
+    try:
+        if CFG_F.exists():
+            return {**DEFAULT_CFG, **json.loads(CFG_F.read_text())}
+    except Exception: pass
+    return dict(DEFAULT_CFG)
+
+def save_cfg(d: dict):
+    try: CFG_F.write_text(json.dumps(d))
+    except Exception: pass
+
+# ═══════════════════════════════════════════════
+#  ICON  (pure Python — no PIL)
+# ═══════════════════════════════════════════════
+def _clamp(v): return max(0, min(255, int(v)))
+
+def _make_png(size: int) -> bytes:
+    BG_C = (8, 12, 10); A1 = (30, 215, 96); A2 = (130, 240, 160)
+    cx = cy = size / 2.0; r = size / 2.0
+    rows = []
+    for y in range(size):
+        row = []
+        for x in range(size):
+            dist = math.hypot(x - cx, y - cy)
+            if dist >= r: row += [0, 0, 0, 0]; continue
+            t  = (dist / r) * 0.5
+            R  = _clamp(BG_C[0] + 40 * t)
+            Gv = _clamp(BG_C[1] + 50 * t)
+            B  = _clamp(BG_C[2] + 30 * t)
+            ring, rw = r * 0.80, r * 0.08
+            if abs(dist - ring) < rw:
+                b2 = 1.0 - abs(dist - ring) / rw
+                R  = _clamp(R  * (1-b2*.8) + A1[0]*b2*.8)
+                Gv = _clamp(Gv * (1-b2*.8) + A1[1]*b2*.8)
+                B  = _clamp(B  * (1-b2*.8) + A1[2]*b2*.8)
+            ts = r * 0.38; rx = (x - cx) + ts * 0.06; ry = y - cy
+            my = ts * (0.60 + rx * 0.52 / ts) if ts > 0 else 0
+            if -ts*.54 <= rx <= ts*.64 and abs(ry) <= my:
+                p2 = _clamp((rx + ts*.54) / (ts*1.18) * 255)
+                R  = _clamp(A1[0]*(1-p2/255*.1) + A2[0]*(p2/255*.1))
+                Gv = _clamp(A1[1]*(1-p2/255*.05))
+                B  = _clamp(A1[2]*(1-p2/255*.2))
+            alpha = _clamp(255*(r-dist)) if dist > r-1.5 else 255
+            row += [_clamp(R), _clamp(Gv), _clamp(B), alpha]
+        rows.append(row)
+    def ck(n, d):
+        crc = zlib.crc32(n+d) & 0xffffffff
+        return struct.pack('>I',len(d)) + n + d + struct.pack('>I',crc)
+    png  = b'\x89PNG\r\n\x1a\n'
+    png += ck(b'IHDR', struct.pack('>IIBBBBB', size,size, 8,6,0,0,0))
+    raw  = b''.join(b'\x00' + bytes(row) for row in rows)
+    png += ck(b'IDAT', zlib.compress(raw, 6))
+    png += ck(b'IEND', b'')
+    return png
+
+def app_icon() -> QIcon:
+    ico = QIcon()
+    for s in [16, 32, 48, 64, 128, 256]:
+        pm = QPixmap(); pm.loadFromData(_make_png(s)); ico.addPixmap(pm)
+    return ico
+
+def icon_pix(size: int) -> QPixmap:
+    pm = QPixmap(); pm.loadFromData(_make_png(size)); return pm
+
+# ═══════════════════════════════════════════════
+#  TOKEN MANAGER
+# ═══════════════════════════════════════════════
 CLIENT_ID     = "SENIN_CLIENT_ID"
 CLIENT_SECRET = "SENIN_CLIENT_SECRET"
 REDIRECT_URI  = "http://127.0.0.1:8888/callback"
-SCOPES        = "user-read-currently-playing user-read-playback-state user-modify-playback-state"
-PORT          = 8888
-CONFIG_FILE   = Path.home() / ".spotify_mini_player.json"
-SETTINGS_FILE = Path.home() / ".spotify_mini_player_settings.json"
+SCOPES        = ("user-read-currently-playing "
+                 "user-read-playback-state "
+                 "user-modify-playback-state")
 
-DEFAULT_SETTINGS = {
-    "x":       -1,   # -1 = ilk açılış, sağ alta koy
-    "y":       -1,
-    "opacity": 90,   # %
-    "scale":   100,  # genişlik % (70–160)
-    # Kısayollar (pynput formatı)
-    "hk_settings":  "<ctrl>+<shift>+s",   # Ayar paneli aç/kapat
-    "hk_collapse":  "<ctrl>+<shift>+m",   # Küçült / Büyüt
-    "hk_playpause": "<ctrl>+<shift>+p",   # Oynat / Duraklat
-    "hk_next":      "<ctrl>+<shift>+n",   # Sonraki şarkı
-    "hk_prev":      "<ctrl>+<shift>+b",   # Önceki şarkı
-}
-
-def load_settings() -> dict:
-    try:
-        if SETTINGS_FILE.exists():
-            d = json.loads(SETTINGS_FILE.read_text())
-            return {**DEFAULT_SETTINGS, **d}
-    except Exception:
-        pass
-    return dict(DEFAULT_SETTINGS)
-
-def save_settings(d: dict):
-    try:
-        SETTINGS_FILE.write_text(json.dumps(d))
-    except Exception:
-        pass
-
-
-# ─────────────────────────────────────────────
-#  TOKEN MANAGER
-# ─────────────────────────────────────────────
-class TokenManager:
+class Tokens:
     def __init__(self):
-        self.access_token  = None
-        self.refresh_token = None
-        self.expiry        = 0
-        self._load()
+        self.access = self.refresh = None
+        self.expiry = 0.0; self._load()
 
     def _load(self):
         try:
-            if CONFIG_FILE.exists():
-                d = json.loads(CONFIG_FILE.read_text())
-                self.refresh_token = d.get("refresh_token")
-                self.access_token  = d.get("access_token")
-                self.expiry        = d.get("expiry", 0)
-        except Exception:
-            pass
+            if AUTH_F.exists():
+                d = json.loads(AUTH_F.read_text())
+                self.access  = d.get("access")
+                self.refresh = d.get("refresh")
+                self.expiry  = d.get("expiry", 0.0)
+        except Exception: pass
 
     def _save(self):
         try:
-            CONFIG_FILE.write_text(json.dumps({
-                "access_token":  self.access_token,
-                "refresh_token": self.refresh_token,
-                "expiry":        self.expiry,
+            AUTH_F.write_text(json.dumps({
+                "access": self.access,
+                "refresh": self.refresh,
+                "expiry": self.expiry,
             }))
-        except Exception:
-            pass
+        except Exception: pass
 
-    def get_token(self):
-        if time.time() > self.expiry - 60 and self.refresh_token:
-            self._refresh()
-        return self.access_token
+    def get(self) -> str | None:
+        if self.refresh and time.time() > self.expiry - 60:
+            self._do_refresh()
+        return self.access
 
-    def _refresh(self):
+    def _do_refresh(self):
         try:
-            creds = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
-            r = requests.post("https://accounts.spotify.com/api/token", data={
-                "grant_type":    "refresh_token",
-                "refresh_token": self.refresh_token,
-            }, headers={"Authorization": f"Basic {creds}"}, timeout=5)
+            creds = base64.b64encode(
+                f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+            r = requests.post(
+                "https://accounts.spotify.com/api/token",
+                data={"grant_type":"refresh_token","refresh_token":self.refresh},
+                headers={"Authorization":f"Basic {creds}"},
+                timeout=6,
+            )
+            if r.ok:
+                d = r.json(); self.access = d["access_token"]
+                self.expiry = time.time() + d["expires_in"]; self._save()
+        except Exception: pass
+
+    def exchange(self, code: str) -> bool:
+        try:
+            creds = base64.b64encode(
+                f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+            r = requests.post(
+                "https://accounts.spotify.com/api/token",
+                data={"grant_type":"authorization_code",
+                      "code":code,"redirect_uri":REDIRECT_URI},
+                headers={"Authorization":f"Basic {creds}"},
+                timeout=6,
+            )
             if r.ok:
                 d = r.json()
-                self.access_token = d["access_token"]
-                self.expiry = time.time() + d["expires_in"]
-                self._save()
-        except Exception:
-            pass
-
-    def exchange(self, code):
-        creds = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
-        r = requests.post("https://accounts.spotify.com/api/token", data={
-            "grant_type":   "authorization_code",
-            "code":         code,
-            "redirect_uri": REDIRECT_URI,
-        }, headers={"Authorization": f"Basic {creds}"}, timeout=5)
-        if r.ok:
-            d = r.json()
-            self.access_token  = d["access_token"]
-            self.refresh_token = d.get("refresh_token", "")
-            self.expiry        = time.time() + d["expires_in"]
-            self._save()
-            return True
+                self.access  = d["access_token"]
+                self.refresh = d.get("refresh_token","")
+                self.expiry  = time.time() + d["expires_in"]
+                self._save(); return True
+        except Exception: pass
         return False
 
     def revoke(self):
-        self.access_token = self.refresh_token = None
-        self.expiry = 0
-        CONFIG_FILE.unlink(missing_ok=True)
+        self.access = self.refresh = None
+        self.expiry = 0.0; AUTH_F.unlink(missing_ok=True)
 
     @property
-    def has_token(self):
-        return bool(self.refresh_token or self.access_token)
+    def ok(self): return bool(self.refresh or self.access)
 
+_tok = Tokens()
 
-token_mgr = TokenManager()
+# ═══════════════════════════════════════════════
+#  OAUTH SERVER
+# ═══════════════════════════════════════════════
+_auth_ev   = threading.Event()
+_auth_code = [None]
 
-
-# ─────────────────────────────────────────────
-#  OAUTH CALLBACK SERVER
-# ─────────────────────────────────────────────
-auth_code_received = threading.Event()
-received_code      = [None]
-
-class OAuthHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
+class _OAuthH(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
     def do_GET(self):
-        p    = urllib.parse.urlparse(self.path)
-        q    = urllib.parse.parse_qs(p.query)
-        code = q.get("code", [None])[0]
-        if code:
-            received_code[0] = code
-            html = b"<html><body style='background:#080b0f;color:#1ed760;font-family:monospace;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;font-size:18px;'><p>&#10003; Giri&#351; ba&#351;ar&#305;l&#305;! Bu pencereyi kapatabilirsin.</p></body></html>"
-        else:
-            html = b"<html><body>Hata: izin reddedildi.</body></html>"
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        _auth_code[0] = qs.get("code",[None])[0]
+        body = (b"<html><body style='background:#080c0a;color:#1ed760;"
+                b"font-family:Segoe UI;display:flex;align-items:center;"
+                b"justify-content:center;height:100vh;margin:0;font-size:1.2rem;'>"
+                b"<p>&#10003; Let Me Play &mdash; Logged in! Close this tab.</p>"
+                b"</body></html>")
         self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(html)
-        auth_code_received.set()
+        self.send_header("Content-Type","text/html;charset=utf-8")
+        self.end_headers(); self.wfile.write(body); _auth_ev.set()
 
-def start_oauth_server():
-    server = http.server.HTTPServer(("localhost", PORT), OAuthHandler)
-    server.timeout = 120
-    server.handle_request()
+def _oauth_server():
+    s = http.server.HTTPServer(("127.0.0.1",PORT),_OAuthH)
+    s.timeout = 120; s.handle_request()
 
-
-# ─────────────────────────────────────────────
-#  SPOTIFY POLLER
-# ─────────────────────────────────────────────
-class SpotifyPoller(QThread):
-    track_updated = pyqtSignal(dict)
-    error         = pyqtSignal(str)
-
-    def __init__(self):
-        super().__init__()
-        self._running = True
-
+# ═══════════════════════════════════════════════
+#  SPOTIFY HELPERS
+# ═══════════════════════════════════════════════
+class Poller(QThread):
+    data = pyqtSignal(dict)
+    def __init__(self): super().__init__(); self._on = True
     def run(self):
-        while self._running:
-            self._poll()
-            time.sleep(5)
-
-    def _poll(self):
-        tok = token_mgr.get_token()
-        if not tok:
-            return
+        while self._on: self.poll(); time.sleep(4)
+    def poll(self):
+        tok = _tok.get()
+        if not tok: return
         try:
             r = requests.get(
                 "https://api.spotify.com/v1/me/player/currently-playing",
-                headers={"Authorization": f"Bearer {tok}"},
-                timeout=4,
+                headers={"Authorization":f"Bearer {tok}"},
+                timeout=5,
             )
-            if r.status_code == 204:
-                self.track_updated.emit({"nothing": True})
-                return
-            if not r.ok:
-                self.error.emit(f"API hatası: {r.status_code}")
-                return
-            d    = r.json()
-            item = d.get("item") or {}
-            imgs = item.get("album", {}).get("images", [])
-            self.track_updated.emit({
-                "name":        item.get("name", ""),
-                "artist":      ", ".join(a["name"] for a in item.get("artists", [])),
-                "art_url":     imgs[-1]["url"] if imgs else None,
-                "progress_ms": d.get("progress_ms", 0),
-                "duration_ms": item.get("duration_ms", 1),
-                "is_playing":  d.get("is_playing", False),
+            if r.status_code == 204: self.data.emit({"idle":True}); return
+            if not r.ok: return
+            d    = r.json(); item = d.get("item") or {}
+            imgs = item.get("album",{}).get("images",[])
+            self.data.emit({
+                "name":    item.get("name",""),
+                "artist":  ", ".join(a["name"] for a in item.get("artists",[])),
+                "art":     imgs[-1]["url"] if imgs else None,
+                "pos":     d.get("progress_ms",0),
+                "dur":     item.get("duration_ms",1),
+                "playing": d.get("is_playing",False),
             })
-        except Exception as e:
-            self.error.emit(str(e))
+        except Exception: pass
+    def stop(self): self._on = False
 
-    def stop(self):
-        self._running = False
-
-
-def spotify_cmd(method, path, body=None):
-    tok = token_mgr.get_token()
-    if not tok:
-        return
+def sp(method, path, body=None):
+    tok = _tok.get()
+    if not tok: return
     try:
-        requests.request(
-            method,
+        requests.request(method,
             f"https://api.spotify.com/v1/me/player{path}",
-            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
-            json=body,
-            timeout=4,
-        )
-    except Exception:
-        pass
+            headers={"Authorization":f"Bearer {tok}",
+                     "Content-Type":"application/json"},
+            json=body, timeout=5)
+    except Exception: pass
 
-
-# ─────────────────────────────────────────────
-#  ALBUM ART LOADER
-# ─────────────────────────────────────────────
 class ArtLoader(QThread):
-    loaded = pyqtSignal(QPixmap)
-
-    def __init__(self, url):
-        super().__init__()
-        self.url = url
-
+    ready = pyqtSignal(QPixmap)
+    def __init__(self, url): super().__init__(); self.url = url
     def run(self):
         try:
-            r   = requests.get(self.url, timeout=4)
-            img = QImage()
-            img.loadFromData(r.content)
-            pix = QPixmap.fromImage(img).scaled(
-                34, 34,
+            data = requests.get(self.url, timeout=5).content
+            img  = QImage(); img.loadFromData(data)
+            raw  = QPixmap.fromImage(img).scaled(
+                ART_SZ, ART_SZ,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            rounded = QPixmap(34, 34)
-            rounded.fill(Qt.GlobalColor.transparent)
-            p = QPainter(rounded)
+                Qt.TransformationMode.SmoothTransformation)
+            out = QPixmap(ART_SZ, ART_SZ)
+            out.fill(Qt.GlobalColor.transparent)
+            p = QPainter(out)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            path = QPainterPath()
-            path.addRoundedRect(0, 0, 34, 34, 5, 5)
-            p.setClipPath(path)
-            p.drawPixmap(0, 0, pix)
-            p.end()
-            self.loaded.emit(rounded)
-        except Exception:
-            pass
+            clip = QPainterPath()
+            clip.addRoundedRect(0,0,ART_SZ,ART_SZ,7,7)
+            p.setClipPath(clip); p.drawPixmap(0,0,raw); p.end()
+            self.ready.emit(out)
+        except Exception: pass
 
-
-# ─────────────────────────────────────────────
-#  CUSTOM WIDGETS
-# ─────────────────────────────────────────────
-class ProgressBar(QWidget):
-    seeked = pyqtSignal(float)
-
+# ═══════════════════════════════════════════════
+#  HOTKEY MANAGER
+# ═══════════════════════════════════════════════
+class HotkeyMgr:
     def __init__(self):
-        super().__init__()
-        self._value = 0.0
-        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._combos:  dict[frozenset, callable] = {}
+        self._pressed: set = set()
+        self._fired:   set = set()
+        self._listener     = None
 
-    def set_value(self, v):
-        self._value = max(0.0, min(1.0, v))
-        self.update()
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        p.setBrush(QBrush(QColor(255, 255, 255, 20)))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(0, 0, w, h, 2, 2)
-        fw = int(w * self._value)
-        if fw > 0:
-            p.setBrush(QBrush(QColor("#1ed760")))
-            p.drawRoundedRect(0, 0, fw, h, 2, 2)
-        p.end()
-
-    def mousePressEvent(self, e):
-        pct = e.position().x() / self.width()
-        self.seeked.emit(max(0.0, min(1.0, pct)))
-
-
-class EQWidget(QWidget):
-    def __init__(self):
-        super().__init__()
-        self._playing = False
-        self._heights = [0.3, 0.7, 0.5, 0.9]
-        self._dirs    = [1, -1, 1, -1]
-        t = QTimer(self)
-        t.timeout.connect(self._animate)
-        t.start(120)
-
-    def set_playing(self, v):
-        self._playing = v
-
-    def _animate(self):
-        if self._playing:
-            self._heights = [
-                max(0.15, min(1.0, h + self._dirs[i] * random.uniform(0.05, 0.2)))
-                for i, h in enumerate(self._heights)
-            ]
-            self._dirs = [
-                1 if h <= 0.15 else (-1 if h >= 1.0 else d)
-                for h, d in zip(self._heights, self._dirs)
-            ]
-        else:
-            self._heights = [0.2] * 4
-        self.update()
-
-    def paintEvent(self, _):
-        p     = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h  = self.width(), self.height()
-        bar_w = 2; gap = 2
-        x_off = (w - (4 * bar_w + 3 * gap)) // 2
-        color = QColor("#1ed760") if self._playing else QColor(80, 80, 80)
-        p.setBrush(QBrush(color)); p.setPen(Qt.PenStyle.NoPen)
-        for i, fh in enumerate(self._heights):
-            bh = max(2, int(h * fh))
-            p.drawRoundedRect(x_off + i * (bar_w + gap), h - bh, bar_w, bh, 1, 1)
-        p.end()
-
-
-
-# ─────────────────────────────────────────────
-#  GLOBAL HOTKEY MANAGER
-#  pynput ile oyun içinde bile çalışır
-# ─────────────────────────────────────────────
-class GlobalHotkeyManager:
-    """
-    Oyun odaklanmış olsa bile sistem seviyesinde kısayol dinler.
-    Callbacks Qt sinyalleri yerine doğrudan çağrılır ama
-    QTimer.singleShot ile ana thread'e yönlendirilir.
-    """
-    def __init__(self):
-        self._callbacks: dict[str, callable] = {}
-        self._pressed:   set = set()
-        self._listener  = None
-        self._combos:    dict[frozenset, str] = {}  # frozenset(keys) → action
-
-    def register(self, action: str, hotkey_str: str, callback: callable):
-        """
-        hotkey_str: "<ctrl>+<shift>+s" formatı
-        action:     benzersiz isim
-        """
-        if not HAS_PYNPUT:
-            return
-        keys = self._parse(hotkey_str)
-        if keys:
-            self._combos[frozenset(keys)] = action
-            self._callbacks[action] = callback
+    def register(self, hk: str, cb: callable):
+        if not HAS_HK: return
+        keys = self._parse(hk)
+        if keys: self._combos[frozenset(keys)] = cb
 
     def _parse(self, s: str) -> list:
-        """'<ctrl>+<shift>+s' → [Key.ctrl, Key.shift, KeyCode('s')]"""
-        if not HAS_PYNPUT:
-            return []
-        parts = [p.strip() for p in s.lower().split("+")]
-        result = []
-        key_map = {
-            "<ctrl>":  pynput_kb.Key.ctrl,
-            "<shift>": pynput_kb.Key.shift,
-            "<alt>":   pynput_kb.Key.alt,
-            "<cmd>":   pynput_kb.Key.cmd,
-        }
-        for p in parts:
-            if p in key_map:
-                result.append(key_map[p])
-            elif len(p) == 1:
-                result.append(pynput_kb.KeyCode.from_char(p))
-            else:
-                try:
-                    result.append(pynput_kb.Key[p.strip("<>")])
-                except Exception:
-                    pass
-        return result
+        km = {"<ctrl>":_kb.Key.ctrl,"<shift>":_kb.Key.shift,"<alt>":_kb.Key.alt}
+        out = []
+        for p in s.lower().split("+"):
+            p = p.strip()
+            if p in km: out.append(km[p])
+            elif len(p) == 1: out.append(_kb.KeyCode.from_char(p))
+        return out
+
+    def _norm(self, k):
+        al = {_kb.Key.ctrl_l:_kb.Key.ctrl, _kb.Key.ctrl_r:_kb.Key.ctrl,
+              _kb.Key.shift_l:_kb.Key.shift,_kb.Key.shift_r:_kb.Key.shift,
+              _kb.Key.alt_l:_kb.Key.alt,   _kb.Key.alt_r:_kb.Key.alt}
+        return al.get(k, k)
 
     def start(self):
-        if not HAS_PYNPUT or self._listener:
-            return
-        def on_press(key):
-            self._pressed.add(self._norm(key))
-            self._check()
-        def on_release(key):
-            self._pressed.discard(self._norm(key))
-        self._listener = pynput_kb.Listener(on_press=on_press, on_release=on_release,
-                                             suppress=False)
-        self._listener.daemon = True
-        self._listener.start()
+        if not HAS_HK or self._listener: return
+        def on_press(k):
+            nk = self._norm(k); self._pressed.add(nk)
+            for combo, cb in self._combos.items():
+                if combo.issubset(self._pressed) and combo not in self._fired:
+                    self._fired.add(combo); QTimer.singleShot(0, cb)
+        def on_release(k):
+            nk = self._norm(k); self._pressed.discard(nk)
+            self._fired = {c for c in self._fired if c.issubset(self._pressed)}
+        self._listener = _kb.Listener(on_press=on_press, on_release=on_release,
+                                       suppress=False)
+        self._listener.daemon = True; self._listener.start()
 
     def stop(self):
-        if self._listener:
-            self._listener.stop()
-            self._listener = None
+        if self._listener: self._listener.stop(); self._listener = None
+        self._combos.clear(); self._pressed.clear(); self._fired.clear()
 
-    def _norm(self, key):
-        # ctrl_l / ctrl_r → ctrl gibi normalize et
-        if not HAS_PYNPUT:
-            return key
-        aliases = {
-            pynput_kb.Key.ctrl_l:  pynput_kb.Key.ctrl,
-            pynput_kb.Key.ctrl_r:  pynput_kb.Key.ctrl,
-            pynput_kb.Key.shift_l: pynput_kb.Key.shift,
-            pynput_kb.Key.shift_r: pynput_kb.Key.shift,
-            pynput_kb.Key.alt_l:   pynput_kb.Key.alt,
-            pynput_kb.Key.alt_r:   pynput_kb.Key.alt,
-        }
-        return aliases.get(key, key)
+_hk = HotkeyMgr()
 
-    def _check(self):
-        for combo, action in self._combos.items():
-            if combo.issubset(self._pressed):
-                cb = self._callbacks.get(action)
-                if cb:
-                    # Ana Qt thread'ine yönlendir
-                    QTimer.singleShot(0, cb)
+# ═══════════════════════════════════════════════
+#  CUSTOM WIDGETS
+# ═══════════════════════════════════════════════
+class ProgBar(QWidget):
+    seeked = pyqtSignal(float)
+    def __init__(self):
+        super().__init__()
+        self._v = 0.0; self._hov = False
+        self.setFixedHeight(4)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setMouseTracking(True)
+    def set_value(self, v):
+        self._v = max(0.0, min(1.0, v)); self.update()
+    def enterEvent(self, _): self._hov = True;  self.update()
+    def leaveEvent(self, _): self._hov = False; self.update()
+    def paintEvent(self, _):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        p.setBrush(QBrush(QColor(255,255,255,22))); p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(0,0,w,h,2,2)
+        fw = int(w * self._v)
+        if fw > 0:
+            g = QLinearGradient(0,0,fw,0)
+            g.setColorAt(0, QColor("#17aa4a")); g.setColorAt(1, QColor("#1ed760"))
+            p.setBrush(QBrush(g)); p.drawRoundedRect(0,0,fw,h,2,2)
+            if self._hov:
+                p.setBrush(QBrush(QColor("#e8f5e9")))
+                p.drawEllipse(fw-5, h//2-5, 10, 10)
+        p.end()
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.seeked.emit(max(0.0, min(1.0, e.position().x()/self.width())))
 
-hotkey_mgr = GlobalHotkeyManager()
+class EQBars(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._on = False
+        self._h  = [0.3, 0.7, 0.5, 0.9]
+        self._d  = [1, -1, 1, -1]
+        t = QTimer(self); t.timeout.connect(self._step); t.start(85)
+    def set_on(self, v): self._on = v
+    def _step(self):
+        if self._on:
+            self._h = [max(0.1,min(1.0,h+self._d[i]*random.uniform(0.07,0.26)))
+                       for i,h in enumerate(self._h)]
+            self._d = [1 if h<=0.1 else(-1 if h>=1.0 else d)
+                       for h,d in zip(self._h,self._d)]
+        else: self._h = [0.15]*4
+        self.update()
+    def paintEvent(self, _):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        bw, gap = 2, 2; xo = (w-(4*bw+3*gap))//2
+        p.setPen(Qt.PenStyle.NoPen)
+        for i, fh in enumerate(self._h):
+            bh = max(2, int(h*fh)); x = xo+i*(bw+gap)
+            if self._on:
+                g = QLinearGradient(0,h-bh,0,h)
+                g.setColorAt(0,QColor("#6ee7a0")); g.setColorAt(1,QColor("#17aa4a"))
+                p.setBrush(QBrush(g))
+            else: p.setBrush(QBrush(QColor(50,80,60)))
+            p.drawRoundedRect(x,h-bh,bw,bh,1,1)
+        p.end()
 
+# ═══════════════════════════════════════════════
+#  SPLASH SCREEN
+# ═══════════════════════════════════════════════
+class Splash(QWidget):
+    done = pyqtSignal()
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint|
+                            Qt.WindowType.WindowStaysOnTopHint|
+                            Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(320, 220)
+        sc = QApplication.primaryScreen().geometry()
+        self.move(sc.center()-QPoint(160,110))
+        self._a = 0; self._phase = 0; self._ticks = 0
+        t = QTimer(self); t.timeout.connect(self._tick); t.start(14)
 
-# ─────────────────────────────────────────────
+    def _tick(self):
+        self._ticks += 1
+        if self._phase == 0:
+            self._a = min(255, self._a+10)
+            if self._a >= 255: self._phase = 1
+        elif self._phase == 1:
+            if self._ticks > 90: self._phase = 2
+        else:
+            self._a = max(0, self._a-8)
+            if self._a == 0: self.done.emit(); self.close(); return
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height(); a = self._a
+
+        # card
+        path = QPainterPath(); path.addRoundedRect(16,16,w-32,h-32,18,18)
+        p.setBrush(QBrush(QColor(8,12,10,a)))
+        p.setPen(QPen(QColor(30,215,96,min(a,90)),1))
+        p.drawPath(path)
+
+        # glow
+        glow = QRadialGradient(w/2,h/2-20,60)
+        glow.setColorAt(0, QColor(30,215,96,min(a,50)))
+        glow.setColorAt(1, QColor(30,215,96,0))
+        p.setBrush(QBrush(glow)); p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(int(w/2-60),int(h/2-80),120,120)
+
+        # icon
+        p.setOpacity(a/255)
+        p.drawPixmap(w//2-28, h//2-68, icon_pix(56))
+
+        # title
+        p.setPen(QColor(232,245,233,a))
+        f = QFont("Segoe UI", 17, QFont.Weight.Bold)
+        p.setFont(f)
+        p.drawText(QRect(0,h//2-4,w,30), Qt.AlignmentFlag.AlignHCenter, APP)
+
+        # sub
+        p.setPen(QColor(30,215,96,min(a,160)))
+        f2 = QFont("Segoe UI", 8)
+        f2.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.0)
+        p.setFont(f2)
+        p.drawText(QRect(0,h//2+28,w,20), Qt.AlignmentFlag.AlignHCenter,
+                   "GAMING MUSIC OVERLAY")
+        p.setOpacity(1.0); p.end()
+
+# ═══════════════════════════════════════════════
 #  SETUP WINDOW
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+_SETUP_SS = f"""
+QWidget      {{ background:{BG}; color:{TEXT};
+               font-family:'Segoe UI',sans-serif; }}
+QLabel       {{ background:transparent; }}
+QLineEdit    {{ background:{CARD}; border:1px solid rgba(30,215,96,0.2);
+               border-radius:8px; color:{TEXT};
+               font-size:12px; padding:10px 12px;
+               font-family:Consolas,monospace; }}
+QLineEdit:focus  {{ border:1px solid {G}; }}
+QPushButton#btn  {{ background:{G}; color:#000; border:none;
+                   border-radius:9px; font-size:13px;
+                   font-weight:700; padding:13px; letter-spacing:0.3px; }}
+QPushButton#btn:hover   {{ background:#2af074; }}
+QPushButton#btn:pressed {{ background:{G2}; }}
+"""
+
 class SetupWindow(QWidget):
-    login_success = pyqtSignal()
+    logged_in = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Spotify Mini Player — Giriş")
-        self.setFixedSize(380, 420)
-        self.setStyleSheet("QWidget{background:#080b0f;color:#f0f2f5;font-family:'Segoe UI';} QLabel{background:transparent;}")
+        self.setWindowTitle(f"{APP} — Sign In")
+        self.setWindowIcon(app_icon())
+        self.setFixedSize(420, 500)
+        self.setStyleSheet(_SETUP_SS)
         self._build()
 
     def _build(self):
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(30, 30, 30, 30)
-        lay.setSpacing(14)
+        lay.setContentsMargins(34,34,34,34); lay.setSpacing(16)
 
-        # Logo
-        logo = QHBoxLayout()
-        dot  = QLabel()
-        pm   = QPixmap(28, 28); pm.fill(Qt.GlobalColor.transparent)
-        pp   = QPainter(pm); pp.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pp.setBrush(QBrush(QColor("#1ed760"))); pp.setPen(Qt.PenStyle.NoPen)
-        pp.drawEllipse(0, 0, 28, 28); pp.end()
-        dot.setPixmap(pm); logo.addWidget(dot)
-        col = QVBoxLayout(); col.setSpacing(1)
-        t1  = QLabel("Spotify Mini Player"); t1.setStyleSheet("font-size:14px;font-weight:700;")
-        t2  = QLabel("for gamers · windows overlay"); t2.setStyleSheet("font-size:9px;color:#556;letter-spacing:1px;")
+        # header
+        hdr = QHBoxLayout(); hdr.setSpacing(14)
+        ico = QLabel(); ico.setPixmap(icon_pix(44)); ico.setFixedSize(44,44)
+        hdr.addWidget(ico)
+        col = QVBoxLayout(); col.setSpacing(3)
+        t1  = QLabel(APP)
+        t1.setStyleSheet(f"font-size:17px;font-weight:700;color:{TEXT};")
+        t2  = QLabel("Gaming Music Overlay  ·  v" + VER)
+        t2.setStyleSheet(f"font-size:10px;color:{G};letter-spacing:0.5px;")
         col.addWidget(t1); col.addWidget(t2)
-        logo.addLayout(col); logo.addStretch()
-        lay.addLayout(logo)
+        hdr.addLayout(col); hdr.addStretch(); lay.addLayout(hdr)
 
-        div = QFrame(); div.setFrameShape(QFrame.Shape.HLine); div.setStyleSheet("color:#1a1f28;")
-        lay.addWidget(div)
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color:{CARD2};"); lay.addWidget(sep)
 
-        # Steps box
+        # steps
         box = QFrame()
-        box.setStyleSheet("background:#0f1318;border-radius:10px;border:1px solid #1a1f28;")
-        bl  = QVBoxLayout(box); bl.setContentsMargins(14, 12, 14, 12); bl.setSpacing(8)
-        hl  = QLabel("NASIL GİRİŞ YAPILIR"); hl.setStyleSheet("font-size:8px;color:#1ed760;letter-spacing:2px;font-weight:600;")
-        bl.addWidget(hl)
-        for num, txt in [
-            ("1", "developer.spotify.com/dashboard → Create App"),
-            ("2", "Redirect URI: http://127.0.0.1:8888/callback"),
-            ("3", "Client ID & Secret'ı aşağıya gir"),
-            ("4", "Giriş Yap → tarayıcıda izin ver → hazır!"),
+        box.setStyleSheet(f"background:{CARD};border-radius:10px;"
+                          f"border:1px solid rgba(30,215,96,0.12);")
+        bl = QVBoxLayout(box); bl.setContentsMargins(16,14,16,14); bl.setSpacing(10)
+        lh = QLabel("HOW TO GET STARTED")
+        lh.setStyleSheet(f"font-size:9px;font-weight:700;color:{G};"
+                         f"letter-spacing:2px;")
+        bl.addWidget(lh)
+        for n, txt in [
+            ("1", "Open developer.spotify.com/dashboard → Create App"),
+            ("2", "Add Redirect URI:  http://127.0.0.1:8888/callback"),
+            ("3", "Copy your Client ID & Client Secret below"),
+            ("4", "Click Sign In → approve in browser → done!"),
         ]:
-            row = QHBoxLayout(); row.setSpacing(8)
-            n   = QLabel(num); n.setFixedSize(18, 18); n.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            n.setStyleSheet("background:#1a2d1a;color:#1ed760;border-radius:9px;font-size:9px;font-weight:600;")
-            t   = QLabel(txt); t.setStyleSheet("font-size:10px;color:#8899aa;"); t.setWordWrap(True)
-            row.addWidget(n); row.addWidget(t, 1); bl.addLayout(row)
+            row = QHBoxLayout(); row.setSpacing(10)
+            nb  = QLabel(n); nb.setFixedSize(22,22)
+            nb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            nb.setStyleSheet(f"background:rgba(30,215,96,0.15);color:{G};"
+                             f"border-radius:11px;font-size:10px;font-weight:700;")
+            tb  = QLabel(txt); tb.setWordWrap(True)
+            tb.setStyleSheet(f"font-size:11px;color:{TEXT_DIM};")
+            row.addWidget(nb); row.addWidget(tb,1); bl.addLayout(row)
         lay.addWidget(box)
 
-        input_style = """
-            QLineEdit{background:#0f1318;border:1px solid #1a1f28;border-radius:7px;
-                color:#f0f2f5;font-size:11px;padding:8px 10px;font-family:'Consolas','Courier New',monospace;}
-            QLineEdit:focus{border:1px solid rgba(30,215,96,0.4);}
-        """
-        for attr, lbl_txt, ph, pw in [
-            ("inp_id",  "Client ID",     "Spotify Client ID",     False),
-            ("inp_sec", "Client Secret", "Spotify Client Secret", True),
+        # inputs
+        for attr, lbl, ph, pwd in [
+            ("_id",  "Client ID",     "Paste your Client ID…",     False),
+            ("_sec", "Client Secret", "Paste your Client Secret…", True),
         ]:
-            l = QLabel(lbl_txt); l.setStyleSheet("font-size:10px;color:#556;"); lay.addWidget(l)
-            w = QLineEdit(); w.setPlaceholderText(ph); w.setStyleSheet(input_style)
-            if pw: w.setEchoMode(QLineEdit.EchoMode.Password)
-            if attr == "inp_id"  and CLIENT_ID     != "SENIN_CLIENT_ID":     w.setText(CLIENT_ID)
-            if attr == "inp_sec" and CLIENT_SECRET != "SENIN_CLIENT_SECRET": w.setText(CLIENT_SECRET)
-            setattr(self, attr, w); lay.addWidget(w)
+            l = QLabel(lbl)
+            l.setStyleSheet(f"font-size:11px;font-weight:600;color:{TEXT_DIM};")
+            lay.addWidget(l)
+            inp = QLineEdit(); inp.setPlaceholderText(ph)
+            if pwd: inp.setEchoMode(QLineEdit.EchoMode.Password)
+            setattr(self, attr, inp); lay.addWidget(inp)
 
-        self.err = QLabel(""); self.err.setStyleSheet("font-size:10px;color:#e05858;min-height:14px;")
-        lay.addWidget(self.err)
+        self._err = QLabel("")
+        self._err.setStyleSheet(f"font-size:10px;color:{DANGER};min-height:14px;")
+        lay.addWidget(self._err)
 
-        btn = QPushButton("  Spotify ile Giriş Yap  →")
+        btn = QPushButton("Sign in with Spotify  →")
+        btn.setObjectName("btn")
         btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        btn.setStyleSheet("""
-            QPushButton{background:#1ed760;color:#000;border:none;border-radius:8px;
-                font-size:12px;font-weight:700;padding:11px 0;letter-spacing:0.5px;}
-            QPushButton:hover{background:#2af074;} QPushButton:pressed{background:#17b84e;}
-        """)
-        btn.clicked.connect(self._login); self.btn = btn; lay.addWidget(btn)
+        btn.clicked.connect(self._login); self._btn = btn; lay.addWidget(btn)
 
     def _login(self):
-        cid = self.inp_id.text().strip(); sec = self.inp_sec.text().strip()
-        if not cid or not sec: self.err.setText("Client ID ve Secret boş olamaz."); return
+        cid = self._id.text().strip(); sec = self._sec.text().strip()
+        if not cid or not sec:
+            self._err.setText("Both fields are required."); return
         global CLIENT_ID, CLIENT_SECRET
         CLIENT_ID = cid; CLIENT_SECRET = sec
-        self.err.setText(""); self.btn.setText("Tarayıcı açılıyor..."); self.btn.setEnabled(False)
-        threading.Thread(target=self._oauth, daemon=True).start()
+        self._err.setText("")
+        self._btn.setText("Opening browser…"); self._btn.setEnabled(False)
+        threading.Thread(target=self._flow, daemon=True).start()
 
-    def _oauth(self):
-        auth_code_received.clear(); received_code[0] = None
-        threading.Thread(target=start_oauth_server, daemon=True).start()
+    def _flow(self):
+        _auth_ev.clear(); _auth_code[0] = None
+        threading.Thread(target=_oauth_server, daemon=True).start()
         url = ("https://accounts.spotify.com/authorize?" +
-               urllib.parse.urlencode({"client_id": CLIENT_ID, "response_type": "code",
-                                       "redirect_uri": REDIRECT_URI, "scope": SCOPES}))
+               urllib.parse.urlencode({
+                   "client_id":     CLIENT_ID,
+                   "response_type": "code",
+                   "redirect_uri":  REDIRECT_URI,
+                   "scope":         SCOPES,
+               }))
         webbrowser.open(url)
-        auth_code_received.wait(timeout=120)
-        code = received_code[0]
-        if code and token_mgr.exchange(code):
-            self.login_success.emit()
+        _auth_ev.wait(timeout=120)
+        code = _auth_code[0]
+        if code and _tok.exchange(code):
+            self.logged_in.emit()
         else:
-            self.err.setText("Giriş başarısız. Tekrar dene.")
-            self.btn.setText("  Spotify ile Giriş Yap  →"); self.btn.setEnabled(True)
+            self._err.setText("Login failed — please try again.")
+            self._btn.setText("Sign in with Spotify  →")
+            self._btn.setEnabled(True)
 
-
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
 #  SETTINGS PANEL
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
+_SET_SS = f"""
+QWidget        {{ background:{BG}; color:{TEXT};
+                 font-family:'Segoe UI',sans-serif; }}
+QLabel         {{ background:transparent; }}
+QSpinBox       {{ background:{CARD}; border:1px solid rgba(30,215,96,0.18);
+                 border-radius:7px; color:{TEXT};
+                 font-size:12px; padding:7px 10px;
+                 font-family:Consolas,monospace; }}
+QSpinBox:focus {{ border:1px solid {G}; }}
+QSpinBox::up-button, QSpinBox::down-button
+               {{ background:{CARD2}; border:none; width:20px; }}
+QLineEdit      {{ background:{CARD}; border:1px solid rgba(30,215,96,0.18);
+                 border-radius:6px; color:{TEXT};
+                 font-size:11px; padding:6px 10px;
+                 font-family:Consolas,monospace; }}
+QLineEdit:focus {{ border:1px solid {G}; }}
+QSlider::groove:horizontal {{ height:3px;
+    background:rgba(255,255,255,0.10); border-radius:2px; }}
+QSlider::sub-page:horizontal {{ background:{G}; border-radius:2px; }}
+QSlider::handle:horizontal {{ width:13px; height:13px; margin:-5px 0;
+    background:{TEXT}; border-radius:7px; }}
+QSlider::handle:horizontal:hover {{ background:{G}; }}
+QPushButton#apply  {{ background:{G}; color:#000; border:none;
+    border-radius:8px; font-size:12px; font-weight:700; padding:11px; }}
+QPushButton#apply:hover   {{ background:#2af074; }}
+QPushButton#apply:pressed {{ background:{G2}; }}
+QPushButton#cancel {{ background:transparent; border:1px solid rgba(255,255,255,0.12);
+    border-radius:8px; color:{TEXT_DIM}; font-size:12px; padding:11px; }}
+QPushButton#cancel:hover {{ border-color:rgba(255,255,255,0.3); color:{TEXT}; }}
+"""
+
 class SettingsPanel(QWidget):
     applied = pyqtSignal(dict)
 
-    def __init__(self, settings: dict, parent=None):
-        super().__init__(parent, Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        self.setWindowTitle("Player Ayarları")
-        self.setFixedSize(340, 680)
-        self.setStyleSheet("QWidget{background:#080b0f;color:#f0f2f5;font-family:'Segoe UI';} QLabel{background:transparent;}")
-        self._s = dict(settings)
-        self._build()
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent, Qt.WindowType.Window|
+                                 Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle(f"{APP} — Settings")
+        self.setWindowIcon(app_icon())
+        self.setFixedSize(360, 700)
+        self.setStyleSheet(_SET_SS)
+        self._cfg = dict(cfg); self._build()
 
     def _build(self):
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(22, 22, 22, 22)
-        lay.setSpacing(14)
+        lay.setContentsMargins(24,24,24,24); lay.setSpacing(14)
 
-        t = QLabel("⊹  Player Ayarları"); t.setStyleSheet("font-size:14px;font-weight:700;")
-        lay.addWidget(t)
+        # header
+        hdr = QHBoxLayout(); hdr.setSpacing(10)
+        ico = QLabel(); ico.setPixmap(icon_pix(30)); ico.setFixedSize(30,30)
+        hdr.addWidget(ico)
+        t = QLabel("Settings")
+        t.setStyleSheet(f"font-size:15px;font-weight:700;color:{TEXT};margin-left:4px;")
+        hdr.addWidget(t); hdr.addStretch(); lay.addLayout(hdr)
 
-        # ── KONUM ──
-        lay.addWidget(self._sec("KONUM"))
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color:{CARD2};"); lay.addWidget(sep)
+
+        SL = f"""
+            QSlider::groove:horizontal {{ height:4px;
+                background:rgba(255,255,255,0.10); border-radius:2px; }}
+            QSlider::sub-page:horizontal {{ background:{G}; border-radius:2px; }}
+            QSlider::handle:horizontal {{ width:13px; height:13px; margin:-5px 0;
+                background:{TEXT}; border-radius:7px; }}
+            QSlider::handle:horizontal:hover {{ background:{G}; }}
+        """
+
+        # ── POSITION ──
+        lay.addWidget(self._sec("POSITION"))
         lay.addWidget(self._hint(
-            "Player'ı sürükleyip bırak — konum otomatik kaydedilir. "
-            "Veya aşağıya piksel koordinatı girerek tam yer belirle."
+            "Drag the player in-game — saves automatically.\n"
+            "Or enter exact pixel coordinates."
         ))
+        crd = QHBoxLayout(); crd.setSpacing(12)
+        for attr, lbl, key, mx in [
+            ("_sx","X  (px)","x",7680), ("_sy","Y  (px)","y",4320)]:
+            col = QVBoxLayout(); col.setSpacing(5)
+            col.addWidget(self._sub(lbl))
+            sb = QSpinBox(); sb.setRange(0,mx)
+            sb.setValue(max(0,self._cfg.get(key,0)))
+            sb.valueChanged.connect(lambda v,k=key: self._cfg.update({k:v}))
+            setattr(self,attr,sb); col.addWidget(sb); crd.addLayout(col)
+        lay.addLayout(crd)
 
-        cr = QHBoxLayout(); cr.setSpacing(10)
-        for label, key, maxv in [("X  (piksel)", "x", 7680), ("Y  (piksel)", "y", 4320)]:
-            col = QVBoxLayout(); col.setSpacing(4)
-            lbl = QLabel(label); lbl.setStyleSheet("font-size:9px;color:#556;letter-spacing:1px;")
-            sb  = QSpinBox(); sb.setRange(0, maxv); sb.setValue(max(0, self._s.get(key, 0)))
-            sb.setStyleSheet("""
-                QSpinBox{background:#0f1318;border:1px solid #1a1f28;border-radius:6px;
-                    color:#f0f2f5;font-size:11px;padding:6px 8px;font-family:'Consolas';}
-                QSpinBox:focus{border-color:rgba(30,215,96,0.4);}
-                QSpinBox::up-button,QSpinBox::down-button{width:18px;background:#161b22;border:none;}
-            """)
-            sb.valueChanged.connect(lambda v, k=key: self._s.update({k: v}))
-            setattr(self, f"sb_{key}", sb)
-            col.addWidget(lbl); col.addWidget(sb); cr.addLayout(col)
-        lay.addLayout(cr)
-
-        # Snap grid
-        lay.addWidget(self._hint("Hızlı yerleştir — ekranın köşelerine / kenarlarına snap:"))
-        snap_rows = [
-            [("↖ Sol Üst","tl"), ("↑ Üst Orta","tc"), ("↗ Sağ Üst","tr")],
-            [("← Sol Orta","ml"),("⊙ Merkez","mc"),   ("→ Sağ Orta","mr")],
-            [("↙ Sol Alt","bl"), ("↓ Alt Orta","bc"),  ("↘ Sağ Alt","br")],
-        ]
-        for row_items in snap_rows:
+        lay.addWidget(self._sub("Quick snap to screen corners / edges:"))
+        snap_style = (
+            f"QPushButton{{background:{CARD};border:1px solid rgba(30,215,96,0.18);"
+            f"border-radius:6px;color:{TEXT_DIM};font-size:10px;padding:5px 0;}}"
+            f"QPushButton:hover{{border-color:{G};color:{G};}}"
+            f"QPushButton:pressed{{background:{G_DIM};}}"
+        )
+        for row_data in [
+            [("↖ Top Left","tl"),("↑ Top Center","tc"),("↗ Top Right","tr")],
+            [("← Mid Left","ml"),("⊙ Center","mc"),    ("→ Mid Right","mr")],
+            [("↙ Bot Left","bl"),("↓ Bot Center","bc"),("↘ Bot Right","br")],
+        ]:
             row = QHBoxLayout(); row.setSpacing(5)
-            for label, key in row_items:
-                b = QPushButton(label); b.setFixedHeight(28)
-                b.setStyleSheet("""
-                    QPushButton{background:#0f1318;border:1px solid #1a1f28;border-radius:5px;
-                        color:#8899aa;font-size:9px;}
-                    QPushButton:hover{border-color:rgba(30,215,96,0.4);color:#1ed760;}
-                    QPushButton:pressed{background:#1a2d1a;}
-                """)
+            for lbl, k in row_data:
+                b = QPushButton(lbl); b.setFixedHeight(30)
+                b.setStyleSheet(snap_style)
                 b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-                b.clicked.connect(lambda _, k=key: self._snap(k))
-                row.addWidget(b)
+                b.clicked.connect(lambda _,kk=k: self._snap(kk)); row.addWidget(b)
             lay.addLayout(row)
 
-        # ── GÖRÜNÜM ──
-        lay.addWidget(self._sec("GÖRÜNÜM"))
-
-        sl_style = """
-            QSlider::groove:horizontal{height:3px;background:rgba(255,255,255,0.08);border-radius:2px;}
-            QSlider::sub-page:horizontal{background:#1ed760;border-radius:2px;}
-            QSlider::handle:horizontal{width:12px;height:12px;margin:-5px 0;background:#fff;border-radius:6px;}
-            QSlider::handle:horizontal:hover{background:#1ed760;}
-        """
-        for attr, label, key, lo, hi, unit in [
-            ("_op",  "Opaklık",  "opacity", 20, 100, "%"),
-            ("_sc",  "Genişlik", "scale",   70, 160, "%"),
+        # ── APPEARANCE ──
+        lay.addWidget(self._sec("APPEARANCE"))
+        for attr, lbl, key, lo, hi, unit in [
+            ("_op","Opacity", "opacity",20,100,"%"),
+            ("_sc","Width",   "scale",  70,160,"%"),
         ]:
             row = QHBoxLayout(); row.setSpacing(10)
-            lbl = QLabel(label); lbl.setStyleSheet("font-size:10px;color:#8899aa;min-width:62px;")
-            sl  = QSlider(Qt.Orientation.Horizontal)
-            sl.setRange(lo, hi); sl.setValue(self._s.get(key, 100 if key=="scale" else 90))
-            sl.setStyleSheet(sl_style)
-            val_lbl = QLabel(f"{sl.value()}{unit}")
-            val_lbl.setStyleSheet("font-size:10px;color:#1ed760;min-width:36px;font-family:'Consolas';")
-            sl.valueChanged.connect(lambda v, k=key, vl=val_lbl, u=unit:
-                                    (self._s.update({k: v}), vl.setText(f"{v}{u}")))
-            setattr(self, f"{attr}_sl", sl); setattr(self, f"{attr}_val", val_lbl)
-            row.addWidget(lbl); row.addWidget(sl, 1); row.addWidget(val_lbl)
+            lb  = QLabel(lbl)
+            lb.setStyleSheet(f"font-size:11px;color:{TEXT_DIM};min-width:60px;")
+            sl  = QSlider(Qt.Orientation.Horizontal); sl.setRange(lo,hi)
+            sl.setValue(self._cfg.get(key,100 if key=="scale" else 94))
+            sl.setStyleSheet(SL)
+            vl  = QLabel(f"{sl.value()}{unit}")
+            vl.setStyleSheet(f"font-size:11px;color:{G};min-width:36px;"
+                             f"font-family:Consolas;")
+            sl.valueChanged.connect(
+                lambda v,k=key,vl2=vl,u=unit:
+                    (self._cfg.update({k:v}),vl2.setText(f"{v}{u}")))
+            setattr(self,f"{attr}_sl",sl); setattr(self,f"{attr}_vl",vl)
+            row.addWidget(lb); row.addWidget(sl,1); row.addWidget(vl)
             lay.addLayout(row)
+
+        # ── HOTKEYS ──
+        lay.addWidget(self._sec("KEYBOARD SHORTCUTS"))
+        st = "active ✓" if HAS_HK else "⚠ install pynput"
+        lay.addWidget(self._hint(
+            f"Works while in-game ({st}).\n"
+            "Format:  <ctrl>+<shift>+letter"
+        ))
+        inp_s = (f"background:{CARD};border:1px solid rgba(30,215,96,0.18);"
+                 f"border-radius:6px;color:{TEXT};font-size:11px;"
+                 f"padding:6px 10px;font-family:Consolas;")
+        for key, lbl in [
+            ("hk_play",     "Play / Pause"),
+            ("hk_next",     "Next track"),
+            ("hk_prev",     "Previous track"),
+            ("hk_collapse", "Collapse / Expand"),
+            ("hk_settings", "Open settings"),
+        ]:
+            row = QHBoxLayout(); row.setSpacing(10)
+            lb  = QLabel(lbl); lb.setFixedWidth(110)
+            lb.setStyleSheet(f"font-size:11px;color:{TEXT_DIM};")
+            inp = QLineEdit(self._cfg.get(key,""))
+            inp.setStyleSheet(inp_s); inp.setEnabled(HAS_HK)
+            inp.textChanged.connect(lambda v,k=key: self._cfg.update({k:v}))
+            row.addWidget(lb); row.addWidget(inp,1); lay.addLayout(row)
 
         lay.addStretch()
 
-        # ── KISAYOLLAR ──
-        lay.addWidget(self._sec("KLAVYE KISAYOLLARI"))
-        if not HAS_PYNPUT:
-            lay.addWidget(self._hint(
-                "⚠ pynput kurulu değil. Kısayolları etkinleştirmek için:\n"
-                "pip install pynput"
-            ))
-        else:
-            lay.addWidget(self._hint(
-                "Oyun içinde çalışır. Format: <ctrl>+<shift>+harf"
-            ))
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet(f"color:{CARD2};"); lay.addWidget(sep2)
 
-        hk_style = """
-            QLineEdit{background:#0f1318;border:1px solid #1a1f28;border-radius:5px;
-                color:#f0f2f5;font-size:10px;padding:5px 8px;font-family:'Consolas';}
-            QLineEdit:focus{border-color:rgba(30,215,96,0.4);}
-        """
-        hk_fields = [
-            ("hk_settings",  "Ayar paneli"),
-            ("hk_collapse",  "Küçült/Büyüt"),
-            ("hk_playpause", "Oynat/Duraklat"),
-            ("hk_next",      "Sonraki şarkı"),
-            ("hk_prev",      "Önceki şarkı"),
-        ]
-        for key, label in hk_fields:
-            row = QHBoxLayout(); row.setSpacing(8)
-            lbl = QLabel(label); lbl.setFixedWidth(90)
-            lbl.setStyleSheet("font-size:9px;color:#8899aa;")
-            inp = QLineEdit(self._s.get(key, ""))
-            inp.setStyleSheet(hk_style)
-            inp.setEnabled(HAS_PYNPUT)
-            inp.textChanged.connect(lambda v, k=key: self._s.update({k: v}))
-            setattr(self, f"hk_{key}", inp)
-            row.addWidget(lbl); row.addWidget(inp, 1)
-            lay.addLayout(row)
-
-        lay.addStretch()
-        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
-        cancel  = QPushButton("İptal")
-        cancel.setStyleSheet("""
-            QPushButton{background:transparent;border:1px solid #1a1f28;border-radius:7px;
-                color:#8899aa;font-size:11px;padding:9px 0;}
-            QPushButton:hover{border-color:rgba(255,255,255,0.2);color:#f0f2f5;}
-        """)
+        br = QHBoxLayout(); br.setSpacing(10)
+        cancel = QPushButton("Cancel"); cancel.setObjectName("cancel")
         cancel.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         cancel.clicked.connect(self.close)
+        apply  = QPushButton("Apply changes"); apply.setObjectName("apply")
+        apply.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        apply.clicked.connect(self._apply)
+        br.addWidget(cancel); br.addWidget(apply,1); lay.addLayout(br)
 
-        apply_btn = QPushButton("Uygula")
-        apply_btn.setStyleSheet("""
-            QPushButton{background:#1ed760;color:#000;border:none;border-radius:7px;
-                font-size:11px;font-weight:700;padding:9px 0;}
-            QPushButton:hover{background:#2af074;} QPushButton:pressed{background:#17b84e;}
-        """)
-        apply_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        apply_btn.clicked.connect(self._apply)
-        btn_row.addWidget(cancel); btn_row.addWidget(apply_btn)
-        lay.addLayout(btn_row)
+    def _sec(self, t):
+        l = QLabel(t)
+        l.setStyleSheet(f"font-size:9px;font-weight:700;color:{G};"
+                        f"letter-spacing:2px;margin-top:4px;")
+        return l
+    def _hint(self, t):
+        l = QLabel(t); l.setWordWrap(True)
+        l.setStyleSheet(f"font-size:10px;color:{TEXT_MUT};line-height:1.6;")
+        return l
+    def _sub(self, t):
+        l = QLabel(t)
+        l.setStyleSheet(f"font-size:10px;color:{TEXT_MUT};")
+        return l
 
-    def _sec(self, text):
-        l = QLabel(text); l.setStyleSheet("font-size:8px;font-weight:600;color:#1ed760;letter-spacing:2px;"); return l
-
-    def _hint(self, text):
-        l = QLabel(text); l.setWordWrap(True)
-        l.setStyleSheet("font-size:9.5px;color:rgba(240,242,245,0.35);line-height:1.5;"); return l
-
-    def _snap(self, key: str):
-        screen = QApplication.primaryScreen().availableGeometry()
-        pw  = int(280 * self._s.get("scale", 100) / 100)
-        ph  = 130
-        pad = 16
+    def _snap(self, k):
+        sc  = QApplication.primaryScreen().availableGeometry()
+        pw  = int(BASE_W * self._cfg.get("scale",100)/100)
+        ph  = 160; pad = 16
         snaps = {
-            "tl": (pad,                              pad),
-            "tc": (screen.width()//2 - pw//2,        pad),
-            "tr": (screen.right()  - pw - pad,       pad),
-            "ml": (pad,                              screen.height()//2 - ph//2),
-            "mc": (screen.width()//2 - pw//2,        screen.height()//2 - ph//2),
-            "mr": (screen.right()  - pw - pad,       screen.height()//2 - ph//2),
-            "bl": (pad,                              screen.bottom() - ph - pad),
-            "bc": (screen.width()//2 - pw//2,        screen.bottom() - ph - pad),
-            "br": (screen.right()  - pw - pad,       screen.bottom() - ph - pad),
+            "tl":(pad, pad),
+            "tc":(sc.width()//2-pw//2, pad),
+            "tr":(sc.right()-pw-pad, pad),
+            "ml":(pad, sc.height()//2-ph//2),
+            "mc":(sc.width()//2-pw//2, sc.height()//2-ph//2),
+            "mr":(sc.right()-pw-pad, sc.height()//2-ph//2),
+            "bl":(pad, sc.bottom()-ph-pad),
+            "bc":(sc.width()//2-pw//2, sc.bottom()-ph-pad),
+            "br":(sc.right()-pw-pad, sc.bottom()-ph-pad),
         }
-        x, y = snaps[key]
-        self._s["x"] = x; self._s["y"] = y
-        self.sb_x.setValue(x); self.sb_y.setValue(y)
+        x, y = snaps[k]; self._cfg["x"]=x; self._cfg["y"]=y
+        self._sx.setValue(x); self._sy.setValue(y)
 
-    def update_pos(self, x: int, y: int):
-        """Player sürüklenince çağrılır — spinbox'ları günceller."""
-        self._s["x"] = x; self._s["y"] = y
-        self.sb_x.setValue(x); self.sb_y.setValue(y)
+    def sync_pos(self, x, y):
+        self._cfg["x"]=x; self._cfg["y"]=y
+        self._sx.setValue(x); self._sy.setValue(y)
 
     def _apply(self):
-        save_settings(self._s)
-        self.applied.emit(dict(self._s))
-        self.close()
+        save_cfg(self._cfg); self.applied.emit(dict(self._cfg)); self.close()
 
+# ═══════════════════════════════════════════════
+#  PLAYER OVERLAY  — main widget
+# ═══════════════════════════════════════════════
+class Player(QWidget):
 
-# ─────────────────────────────────────────────
-#  MAIN PLAYER OVERLAY
-# ─────────────────────────────────────────────
-BASE_WIDTH = 280
+    # ── style sheets ────────────────────────────
+    _SS_CTRL = f"""
+        QPushButton {{
+            background:transparent;
+            color:rgba(232,245,233,0.45);
+            border:none; border-radius:7px;
+            font-size:15px; padding:4px;
+        }}
+        QPushButton:hover {{
+            background:rgba(30,215,96,0.15);
+            color:{TEXT};
+        }}
+        QPushButton:pressed {{ background:rgba(30,215,96,0.28); }}
+        QPushButton[on="true"] {{ color:{G}; }}
+    """
+    _SS_PLAY = f"""
+        QPushButton {{
+            background:{G}; color:#000;
+            border:none; border-radius:19px;
+            font-size:15px; font-weight:700;
+        }}
+        QPushButton:hover   {{ background:#2af074; }}
+        QPushButton:pressed {{ background:{G2}; }}
+    """
+    _SS_COLLAPSE = f"""
+        QPushButton {{
+            background:rgba(30,215,96,0.10);
+            color:rgba(30,215,96,0.55);
+            border:1px solid rgba(30,215,96,0.22);
+            border-radius:11px; font-size:10px;
+        }}
+        QPushButton:hover {{
+            background:rgba(30,215,96,0.22);
+            color:{G};
+            border-color:rgba(30,215,96,0.50);
+        }}
+    """
+    _SS_SETTINGS = f"""
+        QPushButton {{
+            background:rgba(30,215,96,0.08);
+            color:rgba(30,215,96,0.55);
+            border:1px solid rgba(30,215,96,0.18);
+            border-radius:6px;
+            font-size:11px; font-weight:600;
+            padding:2px 8px;
+        }}
+        QPushButton:hover {{
+            background:rgba(30,215,96,0.18);
+            color:{G}; border-color:{G};
+        }}
+        QPushButton:pressed {{ background:rgba(30,215,96,0.30); }}
+    """
+    _SS_SIGNOUT = f"""
+        QPushButton {{
+            background:rgba(239,68,68,0.08);
+            color:rgba(239,68,68,0.55);
+            border:1px solid rgba(239,68,68,0.18);
+            border-radius:6px;
+            font-size:11px; font-weight:600;
+            padding:2px 8px;
+        }}
+        QPushButton:hover {{
+            background:rgba(239,68,68,0.20);
+            color:{DANGER}; border-color:{DANGER};
+        }}
+        QPushButton:pressed {{ background:rgba(239,68,68,0.32); }}
+    """
 
-class PlayerOverlay(QWidget):
     def __init__(self):
         super().__init__()
-        self.collapsed   = False
-        self.is_playing  = False
-        self.cur_ms      = 0
-        self.dur_ms      = 1
-        self._drag_pos   = None
-        self._art_loader = None
-        self._poller     = None
-        self._last_art   = None
-        self._settings   = load_settings()
-        self._panel      = None
+        self._cfg       = load_cfg()
+        self._collapsed = False
+        self._playing   = False
+        self._cur       = 0
+        self._dur       = 1
+        self._drag      = None
+        self._art_url   = None
+        self._art_job   = None
+        self._panel     = None
+        self._poller    = None
 
-        self._setup_window()
-        self._build_ui()
-        self._apply_settings(self._settings, initial=True)
-        self._start_poller()
-        self._register_hotkeys()
+        self._setup_win()
+        self._build()
+        self._apply_cfg(self._cfg, first=True)
+        self._start_poll()
+        self._bind_hk()
 
-        self._tick = QTimer(self)
-        self._tick.timeout.connect(self._on_tick)
-        self._tick.start(1000)
+        self._ticker = QTimer(self)
+        self._ticker.timeout.connect(self._tick)
+        self._ticker.start(1000)
 
-    def _setup_window(self):
+        self._vol_db = QTimer(self)
+        self._vol_db.setSingleShot(True)
+        self._vol_db.timeout.connect(self._send_vol)
+
+    def _setup_win(self):
+        self.setWindowTitle(APP)
+        self.setWindowIcon(app_icon())
         self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
-    def _apply_settings(self, s: dict, initial=False):
-        self._settings = s
-        # Genişlik
-        scale = s.get("scale", 100) / 100.0
-        self._main.setFixedWidth(int(BASE_WIDTH * scale))
+    def _apply_cfg(self, cfg, first=False):
+        self._cfg = cfg
+        scale = cfg.get("scale",100)/100.0
+        self._card.setFixedWidth(int(BASE_W*scale))
         self.adjustSize()
-        # Opaklık
-        self.setWindowOpacity(s.get("opacity", 90) / 100.0)
-        # Konum
-        x, y = s.get("x", -1), s.get("y", -1)
-        if x < 0 or y < 0 or initial:
-            screen = QApplication.primaryScreen().availableGeometry()
-            if x < 0: x = screen.right()  - self.width()  - 16
-            if y < 0: y = screen.bottom() - self.height() - 16
+        self.setWindowOpacity(cfg.get("opacity",94)/100.0)
+        x, y = cfg.get("x",-1), cfg.get("y",-1)
+        if x < 0 or y < 0 or first:
+            sc = QApplication.primaryScreen().availableGeometry()
+            if x < 0: x = sc.right()  - self.width()  - 16
+            if y < 0: y = sc.bottom() - self.height() - 16
         self.move(x, y)
-        # Kısayolları yeniden kaydet
-        if not initial:
-            hotkey_mgr.stop()
-            self._register_hotkeys()
-        else:
-            self._update_tooltips()
+        if not first: _hk.stop(); self._bind_hk()
+        else: self._update_tips()
 
-    # ── BUILD UI ──
-    def _build_ui(self):
-        self._main = QWidget(self)
-        self._main.setObjectName("main")
-        self._main.setStyleSheet("""
-            QWidget#main{background:rgba(8,11,15,242);
-                border:1px solid rgba(255,255,255,18);border-radius:13px;}
+    # ── BUILD UI ────────────────────────────────
+    def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6,6,6,6)   # room for shadow
+
+        self._card = QWidget(self)
+        self._card.setObjectName("card")
+        self._card.setStyleSheet(f"""
+            QWidget#card {{
+                background:rgba(8,12,10,248);
+                border:1px solid rgba(30,215,96,0.22);
+                border-radius:14px;
+            }}
         """)
         sh = QGraphicsDropShadowEffect(self)
-        sh.setBlurRadius(30); sh.setOffset(0, 6); sh.setColor(QColor(0, 0, 0, 180))
-        self._main.setGraphicsEffect(sh)
+        sh.setBlurRadius(32); sh.setOffset(0,6)
+        sh.setColor(QColor(0,0,0,210))
+        self._card.setGraphicsEffect(sh)
+        outer.addWidget(self._card)
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(self._main)
+        lay = QVBoxLayout(self._card)
+        lay.setContentsMargins(0,0,0,0); lay.setSpacing(0)
 
-        self._lay = QVBoxLayout(self._main)
-        self._lay.setContentsMargins(0, 0, 0, 0)
-        self._lay.setSpacing(0)
+        # ── TOP BAR ─────────────────────────────
+        top = QWidget(); top.setFixedHeight(60)
+        tl  = QHBoxLayout(top)
+        tl.setContentsMargins(12,10,12,10); tl.setSpacing(10)
 
-        # ── TOP BAR ──
-        top = QWidget(); top.setFixedHeight(52)
-        tl  = QHBoxLayout(top); tl.setContentsMargins(10, 9, 10, 9); tl.setSpacing(8)
+        # album art
+        self._art = QLabel()
+        self._art.setFixedSize(ART_SZ, ART_SZ)
+        self._art.setStyleSheet(
+            f"border-radius:7px; background:{CARD2};")
+        self._reset_art(); tl.addWidget(self._art)
 
-        self._art_lbl = QLabel(); self._art_lbl.setFixedSize(34, 34)
-        self._art_lbl.setStyleSheet("border-radius:5px;background:#1c2028;")
-        self._set_placeholder_art(); tl.addWidget(self._art_lbl)
+        # title + artist
+        meta = QWidget(); ml = QVBoxLayout(meta)
+        ml.setContentsMargins(0,0,0,0); ml.setSpacing(3)
+        self._title = QLabel("Loading…")
+        self._title.setStyleSheet(
+            f"font-size:12px;font-weight:700;color:{TEXT};")
+        self._artist = QLabel(APP)
+        self._artist.setStyleSheet(
+            f"font-size:10px;color:{TEXT_DIM};"
+            f"font-family:Consolas;")
+        self._title.setMaximumWidth(170)
+        self._artist.setMaximumWidth(170)
+        ml.addWidget(self._title); ml.addWidget(self._artist)
+        tl.addWidget(meta, 1)
 
-        info = QWidget(); il = QVBoxLayout(info); il.setContentsMargins(0,0,0,0); il.setSpacing(1)
-        self._name_lbl   = QLabel("Yükleniyor...")
-        self._artist_lbl = QLabel("Spotify")
-        self._name_lbl.setStyleSheet("font-size:11px;font-weight:600;color:#f0f2f5;")
-        self._artist_lbl.setStyleSheet("font-size:9px;color:rgba(240,242,245,0.45);font-family:'Consolas';")
-        self._name_lbl.setMaximumWidth(155); self._artist_lbl.setMaximumWidth(155)
-        il.addWidget(self._name_lbl); il.addWidget(self._artist_lbl)
-        tl.addWidget(info, 1)
+        # EQ + collapse
+        self._eq = EQBars(); self._eq.setFixedSize(26,16)
+        tl.addWidget(self._eq)
+        self._col = QPushButton("▾"); self._col.setFixedSize(22,22)
+        self._col.setStyleSheet(self._SS_COLLAPSE)
+        self._col.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._col.clicked.connect(self.toggle_col)
+        tl.addWidget(self._col)
+        lay.addWidget(top)
 
-        self._eq_w = EQWidget(); self._eq_w.setFixedSize(22, 16)
-        tl.addWidget(self._eq_w)
-
-        self._col_btn = QPushButton("▾"); self._col_btn.setFixedSize(22, 22)
-        self._col_btn.setStyleSheet("""
-            QPushButton{background:#161b22;color:rgba(240,242,245,0.45);
-                border:1px solid rgba(255,255,255,0.07);border-radius:11px;font-size:10px;}
-            QPushButton:hover{background:rgba(30,215,96,0.15);color:#1ed760;
-                border-color:rgba(30,215,96,0.3);}
-        """)
-        self._col_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._col_btn.clicked.connect(self._toggle_collapse)
-        tl.addWidget(self._col_btn)
-        self._lay.addWidget(top)
-
-        # ── BODY ──
+        # ── BODY (collapsible) ───────────────────
         self._body = QWidget()
-        bl = QVBoxLayout(self._body); bl.setContentsMargins(10, 2, 10, 10); bl.setSpacing(6)
+        bl = QVBoxLayout(self._body)
+        bl.setContentsMargins(12,4,12,12); bl.setSpacing(8)
 
-        self._prog = ProgressBar(); self._prog.setFixedHeight(3)
-        self._prog.seeked.connect(self._on_seek); bl.addWidget(self._prog)
-        tr = QHBoxLayout()
-        self._t_cur = QLabel("0:00"); self._t_tot = QLabel("0:00")
-        for l in (self._t_cur, self._t_tot):
-            l.setStyleSheet("font-size:8px;color:rgba(240,242,245,0.2);font-family:'Consolas';")
-        tr.addWidget(self._t_cur); tr.addStretch(); tr.addWidget(self._t_tot)
-        bl.addLayout(tr)
+        # progress
+        self._prog = ProgBar(); self._prog.seeked.connect(self._seek)
+        bl.addWidget(self._prog)
+        trow = QHBoxLayout()
+        self._tc = QLabel("0:00"); self._td = QLabel("0:00")
+        for l in (self._tc, self._td):
+            l.setStyleSheet(f"font-size:9px;color:{TEXT_MUT};"
+                            f"font-family:Consolas;")
+        trow.addWidget(self._tc); trow.addStretch(); trow.addWidget(self._td)
+        bl.addLayout(trow)
 
+        # controls
         cr = QHBoxLayout(); cr.setSpacing(0)
-        self._sh_btn   = self._mk_ctrl("⇄", 28, toggle=True)
-        self._prev_btn = self._mk_ctrl("⏮", 28)
-        self._play_btn = self._mk_ctrl("▶", 34, is_play=True)
-        self._next_btn = self._mk_ctrl("⏭", 28)
-        self._rep_btn  = self._mk_ctrl("↻", 28, toggle=True)
-        self._sh_btn.setToolTip("Karıştır")
-        self._prev_btn.setToolTip("Önceki şarkı")
-        self._play_btn.setToolTip("Oynat / Duraklat")
-        self._next_btn.setToolTip("Sonraki şarkı")
-        self._rep_btn.setToolTip("Tekrar")
-        self._sh_btn.clicked.connect(self._do_shuffle)
-        self._prev_btn.clicked.connect(lambda: self._do_cmd("previous"))
-        self._play_btn.clicked.connect(self._do_play)
-        self._next_btn.clicked.connect(lambda: self._do_cmd("next"))
-        self._rep_btn.clicked.connect(self._do_repeat)
+        self._sh  = self._ctrl("⇄", 32)
+        self._prv = self._ctrl("⏮", 32)
+        self._ply = self._play_btn()
+        self._nxt = self._ctrl("⏭", 32)
+        self._rep = self._ctrl("↻", 32)
+        self._sh.clicked.connect(self._do_shuffle)
+        self._prv.clicked.connect(lambda: self._cmd("previous"))
+        self._ply.clicked.connect(self._do_play)
+        self._nxt.clicked.connect(lambda: self._cmd("next"))
+        self._rep.clicked.connect(self._do_repeat)
         cr.addStretch()
-        for b in (self._sh_btn, self._prev_btn, self._play_btn, self._next_btn, self._rep_btn):
+        for b in (self._sh,self._prv,self._ply,self._nxt,self._rep):
             cr.addWidget(b)
         cr.addStretch(); bl.addLayout(cr)
 
-        vr = QHBoxLayout(); vr.setSpacing(6)
-        vi = QLabel("🔉"); vi.setStyleSheet("font-size:11px;")
+        # volume
+        vr = QHBoxLayout(); vr.setSpacing(8)
+        vi = QLabel("🔉"); vi.setStyleSheet("font-size:12px;")
         self._vol = QSlider(Qt.Orientation.Horizontal)
-        self._vol.setRange(0, 100); self._vol.setValue(70); self._vol.setFixedHeight(14)
-        self._vol.setStyleSheet("""
-            QSlider::groove:horizontal{height:3px;background:rgba(255,255,255,0.08);border-radius:2px;}
-            QSlider::sub-page:horizontal{background:#1ed760;border-radius:2px;}
-            QSlider::handle:horizontal{width:10px;height:10px;margin:-4px 0;background:#fff;border-radius:5px;}
-            QSlider::handle:horizontal:hover{background:#1ed760;}
+        self._vol.setRange(0,100); self._vol.setValue(70)
+        self._vol.setFixedHeight(16)
+        self._vol.setStyleSheet(f"""
+            QSlider::groove:horizontal{{height:4px;
+                background:rgba(255,255,255,0.10);border-radius:2px;}}
+            QSlider::sub-page:horizontal{{background:{G};border-radius:2px;}}
+            QSlider::handle:horizontal{{width:12px;height:12px;margin:-4px 0;
+                background:{TEXT};border-radius:6px;}}
+            QSlider::handle:horizontal:hover{{background:{G};}}
         """)
-        self._vol.valueChanged.connect(self._do_volume)
-        self._vol_pct = QLabel("70%")
-        self._vol_pct.setStyleSheet("font-size:8px;color:rgba(240,242,245,0.2);font-family:'Consolas';min-width:24px;")
-        vr.addWidget(vi); vr.addWidget(self._vol, 1); vr.addWidget(self._vol_pct)
+        self._vol.valueChanged.connect(self._on_vol)
+        self._vp = QLabel("70%")
+        self._vp.setStyleSheet(f"font-size:9px;color:{TEXT_MUT};"
+                               f"font-family:Consolas;min-width:28px;")
+        vr.addWidget(vi); vr.addWidget(self._vol,1); vr.addWidget(self._vp)
         bl.addLayout(vr)
-        self._lay.addWidget(self._body)
+        lay.addWidget(self._body)
 
-        # ── STRIP ──
-        strip = QWidget(); strip.setFixedHeight(22)
-        strip.setStyleSheet("border-top:1px solid rgba(255,255,255,0.05);")
-        sl = QHBoxLayout(strip); sl.setContentsMargins(10, 0, 10, 0); sl.setSpacing(0)
+        # ── STRIP ────────────────────────────────
+        strip = QWidget(); strip.setFixedHeight(32)
+        strip.setStyleSheet(
+            f"border-top:1px solid rgba(30,215,96,0.12);"
+            f"background:rgba(8,12,10,0.6);")
+        sl = QHBoxLayout(strip)
+        sl.setContentsMargins(10,0,10,0); sl.setSpacing(6)
 
-        sp = QLabel("●"); sp.setStyleSheet("font-size:8px;color:#1ed760;")
-        lb = QLabel("spotify mini")
-        lb.setStyleSheet("font-size:7px;color:rgba(240,242,245,0.2);letter-spacing:1px;margin-left:3px;")
-        sl.addWidget(sp); sl.addWidget(lb); sl.addStretch()
+        # logo
+        ic2 = QLabel(); ic2.setPixmap(icon_pix(14)); ic2.setFixedSize(14,14)
+        lb2 = QLabel("Let Me Play")
+        lb2.setStyleSheet(f"font-size:9px;font-weight:600;color:{TEXT_MUT};"
+                          f"letter-spacing:0.5px;margin-left:3px;")
+        sl.addWidget(ic2); sl.addWidget(lb2); sl.addStretch()
 
-        self._conn_lbl = QLabel("bağlanıyor")
-        self._conn_lbl.setStyleSheet("font-size:7px;color:rgba(240,242,245,0.2);font-family:'Consolas';")
-        sl.addWidget(self._conn_lbl)
+        # status
+        self._status = QLabel("connecting")
+        self._status.setStyleSheet(f"font-size:9px;color:{TEXT_MUT};"
+                                   f"font-family:Consolas;")
+        sl.addWidget(self._status)
 
-        self._settings_btn = QPushButton(" ⊹")
-        self._settings_btn.setStyleSheet("""
-            QPushButton{background:transparent;color:rgba(240,242,245,0.25);
-                border:none;font-size:11px;padding:0 4px;}
-            QPushButton:hover{color:#1ed760;}
-        """)
-        self._settings_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._settings_btn.clicked.connect(self._open_settings)
-        sl.addWidget(self._settings_btn)
+        sl.addSpacing(8)
 
-        disc = QPushButton("çıkış")
-        disc.setStyleSheet("""
-            QPushButton{background:transparent;color:rgba(240,242,245,0.2);
-                border:none;font-size:7px;padding:0 0 0 6px;}
-            QPushButton:hover{color:#e05858;}
-        """)
-        disc.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        disc.clicked.connect(self._do_logout)
-        sl.addWidget(disc)
-        self._lay.addWidget(strip)
+        # ⚙ Settings button — visible, distinct
+        self._set_btn = QPushButton("⚙  Settings")
+        self._set_btn.setStyleSheet(self._SS_SETTINGS)
+        self._set_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._set_btn.setFixedHeight(22)
+        self._set_btn.clicked.connect(self.open_settings)
+        sl.addWidget(self._set_btn)
+
+        sl.addSpacing(6)
+
+        # Sign out button — red, distinct
+        self._out_btn = QPushButton("⏻  Sign Out")
+        self._out_btn.setStyleSheet(self._SS_SIGNOUT)
+        self._out_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._out_btn.setFixedHeight(22)
+        self._out_btn.clicked.connect(self._sign_out)
+        sl.addWidget(self._out_btn)
+
+        lay.addWidget(strip)
         self.adjustSize()
 
-    def _mk_ctrl(self, icon, size, toggle=False, is_play=False):
+    def _ctrl(self, icon, size) -> QPushButton:
         b = QPushButton(icon); b.setFixedSize(size, size)
         b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        b.setProperty("toggled", False)
-        if is_play:
-            b.setStyleSheet("""
-                QPushButton{background:#1ed760;color:#000;border:none;border-radius:17px;font-size:12px;}
-                QPushButton:hover{background:#2af074;} QPushButton:pressed{background:#17b84e;}
-            """)
-        else:
-            b.setStyleSheet("""
-                QPushButton{background:transparent;color:rgba(240,242,245,0.4);
-                    border:none;border-radius:6px;font-size:12px;padding:4px;}
-                QPushButton:hover{background:rgba(255,255,255,0.05);color:#f0f2f5;}
-                QPushButton[toggled="true"]{color:#1ed760;}
-            """)
+        b.setProperty("on", "false")
+        b.setStyleSheet(self._SS_CTRL)
         return b
 
-    def _set_placeholder_art(self):
-        px = QPixmap(34, 34); px.fill(QColor("#1c2028"))
-        self._art_lbl.setPixmap(px)
+    def _play_btn(self) -> QPushButton:
+        b = QPushButton("▶"); b.setFixedSize(38, 38)
+        b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        b.setStyleSheet(self._SS_PLAY)
+        return b
 
-    def _register_hotkeys(self):
-        s = self._settings
-        hotkey_mgr.register("settings",  s.get("hk_settings",  "<ctrl>+<shift>+s"), self._open_settings)
-        hotkey_mgr.register("collapse",  s.get("hk_collapse",  "<ctrl>+<shift>+m"), self._toggle_collapse)
-        hotkey_mgr.register("playpause", s.get("hk_playpause", "<ctrl>+<shift>+p"), self._do_play)
-        hotkey_mgr.register("next",      s.get("hk_next",      "<ctrl>+<shift>+n"), lambda: self._do_cmd("next"))
-        hotkey_mgr.register("prev",      s.get("hk_prev",      "<ctrl>+<shift>+b"), lambda: self._do_cmd("previous"))
-        hotkey_mgr.start()
-        self._update_tooltips()
+    def _reset_art(self):
+        px = QPixmap(ART_SZ, ART_SZ)
+        px.fill(QColor(CARD2))
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QColor(30,215,96,60))
+        p.setFont(QFont("Segoe UI", 16))
+        p.drawText(QRect(0,0,ART_SZ,ART_SZ),
+                   Qt.AlignmentFlag.AlignCenter, "♪")
+        p.end()
+        self._art.setPixmap(px)
 
-    def _update_tooltips(self):
-        s = self._settings
-        def fmt(key, default):
-            raw = s.get(key, default)
-            # "<ctrl>+<shift>+p" → "Ctrl+Shift+P"
-            return (raw.replace("<ctrl>", "Ctrl")
-                       .replace("<shift>", "Shift")
-                       .replace("<alt>", "Alt")
-                       .upper()
-                       .replace("+", " + "))
-
-        pp  = fmt("hk_playpause", "<ctrl>+<shift>+p")
-        nxt = fmt("hk_next",      "<ctrl>+<shift>+n")
-        prv = fmt("hk_prev",      "<ctrl>+<shift>+b")
-        col = fmt("hk_collapse",  "<ctrl>+<shift>+m")
-        stg = fmt("hk_settings",  "<ctrl>+<shift>+s")
-
-        self._play_btn.setToolTip(f"Oynat / Duraklat  [{pp}]")
-        self._next_btn.setToolTip(f"Sonraki şarkı  [{nxt}]")
-        self._prev_btn.setToolTip(f"Önceki şarkı  [{prv}]")
-        self._col_btn.setToolTip(f"Küçült / Büyüt  [{col}]")
-
-        hk_status = "etkin ✓" if HAS_PYNPUT else "pynput kurulu değil"
-        self._settings_btn.setToolTip(
-            f"Konum & görünüm ayarları  [{stg}]\n"
-            f"─────────────────────────\n"
-            f"Klavye kısayolları ({hk_status}):\n"
-            f"  Oynat/Duraklat   {pp}\n"
-            f"  Sonraki          {nxt}\n"
-            f"  Önceki           {prv}\n"
-            f"  Küçült/Büyüt     {col}\n"
-            f"  Bu panel         {stg}"
-        )
-
-    # ── SETTINGS ──
-    def _open_settings(self):
-        if self._panel and self._panel.isVisible():
-            self._panel.raise_(); return
-        s = dict(self._settings); s["x"] = self.x(); s["y"] = self.y()
-        self._panel = SettingsPanel(s)
-        self._panel.applied.connect(self._apply_settings)
-        screen = QApplication.primaryScreen().availableGeometry()
-        px = self.x() - 350 if self.x() > 350 else self.x() + self.width() + 8
-        py = max(screen.top(), min(self.y(), screen.bottom() - 480))
-        self._panel.move(px, py); self._panel.show()
-
-    # ── POLLER ──
-    def _start_poller(self):
-        self._poller = SpotifyPoller()
-        self._poller.track_updated.connect(self._on_track)
-        self._poller.error.connect(lambda _: self._conn_lbl.setText("hata"))
+    # ── POLLING ─────────────────────────────────
+    def _start_poll(self):
+        self._poller = Poller()
+        self._poller.data.connect(self._on_data)
         self._poller.start()
 
-    def _on_track(self, d):
-        if d.get("nothing"):
-            self._name_lbl.setText("Çalmıyor"); self._artist_lbl.setText("Spotify'ı aç")
-            self._conn_lbl.setText("bekliyor"); self.is_playing = False; self._update_play(); return
-        self._name_lbl.setText(self._elide(d.get("name",""), 18))
-        self._artist_lbl.setText(self._elide(d.get("artist",""), 22))
-        self.cur_ms = d["progress_ms"]; self.dur_ms = d["duration_ms"]
-        self.is_playing = d["is_playing"]; self._update_play(); self._update_prog()
-        self._conn_lbl.setText("bağlı ✓")
-        art = d.get("art_url")
-        if art and art != self._last_art:
-            self._last_art = art
-            if self._art_loader: self._art_loader.terminate()
-            self._art_loader = ArtLoader(art)
-            self._art_loader.loaded.connect(self._art_lbl.setPixmap)
-            self._art_loader.start()
+    def _on_data(self, d: dict):
+        if d.get("idle"):
+            self._title.setText("Nothing playing")
+            self._artist.setText("Open Spotify on any device")
+            self._status.setText("idle")
+            self._playing = False; self._upd_play(); return
 
-    def _on_tick(self):
-        if self.is_playing: self.cur_ms += 1000; self._update_prog()
+        self._title.setText(self._elide(d["name"], 22))
+        self._artist.setText(self._elide(d["artist"], 26))
+        self._cur = d["pos"]; self._dur = d["dur"]
+        self._playing = d["playing"]
+        self._upd_play(); self._upd_prog()
+        self._status.setText("connected ✓")
 
-    def _update_prog(self):
-        self._prog.set_value(min(self.cur_ms / self.dur_ms, 1.0))
-        self._t_cur.setText(self._fmt(self.cur_ms)); self._t_tot.setText(self._fmt(self.dur_ms))
+        art = d.get("art")
+        if art and art != self._art_url:
+            self._art_url = art
+            if self._art_job: self._art_job.terminate()
+            self._art_job = ArtLoader(art)
+            self._art_job.ready.connect(self._art.setPixmap)
+            self._art_job.start()
 
-    def _update_play(self):
-        self._play_btn.setText("⏸" if self.is_playing else "▶")
-        self._eq_w.set_playing(self.is_playing)
+    def _tick(self):
+        if self._playing: self._cur += 1000; self._upd_prog()
 
-    # ── CONTROLS ──
+    def _upd_prog(self):
+        self._prog.set_value(min(self._cur / self._dur, 1.0))
+        self._tc.setText(self._ms(self._cur))
+        self._td.setText(self._ms(self._dur))
+
+    def _upd_play(self):
+        self._ply.setText("⏸" if self._playing else "▶")
+        self._eq.set_on(self._playing)
+
+    # ── CONTROLS ─────────────────────────────────
     def _do_play(self):
-        ep = "/pause" if self.is_playing else "/play"
-        threading.Thread(target=spotify_cmd, args=("PUT", ep), daemon=True).start()
-        self.is_playing = not self.is_playing; self._update_play()
+        ep = "/pause" if self._playing else "/play"
+        threading.Thread(target=sp,args=("PUT",ep),daemon=True).start()
+        self._playing = not self._playing; self._upd_play()
 
-    def _do_cmd(self, cmd):
-        threading.Thread(target=spotify_cmd, args=("POST", f"/{cmd}"), daemon=True).start()
-        QTimer.singleShot(800, self._poller._poll)
+    def _cmd(self, action):
+        threading.Thread(target=sp,args=("POST",f"/{action}"),daemon=True).start()
+        QTimer.singleShot(450, self._poller.poll)   # fast refresh
 
     def _do_shuffle(self):
-        s = not (self._sh_btn.property("toggled") or False)
-        self._sh_btn.setProperty("toggled", s)
-        self._sh_btn.style().unpolish(self._sh_btn); self._sh_btn.style().polish(self._sh_btn)
-        threading.Thread(target=spotify_cmd, args=("PUT", f"/shuffle?state={str(s).lower()}"), daemon=True).start()
+        on = self._sh.property("on") != "true"
+        self._sh.setProperty("on","true" if on else "false")
+        self._sh.setStyleSheet(self._SS_CTRL)
+        threading.Thread(target=sp,
+            args=("PUT",f"/shuffle?state={str(on).lower()}"),daemon=True).start()
 
     def _do_repeat(self):
-        s = not (self._rep_btn.property("toggled") or False)
-        self._rep_btn.setProperty("toggled", s)
-        self._rep_btn.style().unpolish(self._rep_btn); self._rep_btn.style().polish(self._rep_btn)
-        threading.Thread(target=spotify_cmd, args=("PUT", f"/repeat?state={'context' if s else 'off'}"), daemon=True).start()
+        on = self._rep.property("on") != "true"
+        self._rep.setProperty("on","true" if on else "false")
+        self._rep.setStyleSheet(self._SS_CTRL)
+        threading.Thread(target=sp,
+            args=("PUT",f"/repeat?state={'context' if on else 'off'}"),
+            daemon=True).start()
 
-    def _do_volume(self, v):
-        self._vol_pct.setText(f"{v}%")
-        threading.Thread(target=spotify_cmd, args=("PUT", f"/volume?volume_percent={v}"), daemon=True).start()
+    def _on_vol(self, v):
+        self._vp.setText(f"{v}%")
+        self._vol_db.start(260)   # debounce 260 ms
 
-    def _on_seek(self, pct):
-        pos = int(pct * self.dur_ms); self.cur_ms = pos; self._update_prog()
-        threading.Thread(target=spotify_cmd, args=("PUT", f"/seek?position_ms={pos}"), daemon=True).start()
+    def _send_vol(self):
+        v = self._vol.value()
+        threading.Thread(target=sp,
+            args=("PUT",f"/volume?volume_percent={v}"),daemon=True).start()
 
-    def _do_logout(self):
+    def _seek(self, pct):
+        pos = int(pct * self._dur); self._cur = pos; self._upd_prog()
+        threading.Thread(target=sp,
+            args=("PUT",f"/seek?position_ms={pos}"),daemon=True).start()
+
+    # ── COLLAPSE ────────────────────────────────
+    def toggle_col(self):
+        self._collapsed = not self._collapsed
+        self._body.setVisible(not self._collapsed)
+        self._col.setText("▸" if self._collapsed else "▾")
+        ox, oy = self.x(), self.y()
+        self.adjustSize(); self.move(ox, oy)
+        s = dict(self._cfg); s["x"]=ox; s["y"]=oy; save_cfg(s)
+
+    # ── SETTINGS ────────────────────────────────
+    def open_settings(self):
+        if self._panel and self._panel.isVisible():
+            self._panel.raise_(); return
+        s = dict(self._cfg); s["x"]=self.x(); s["y"]=self.y()
+        self._panel = SettingsPanel(s)
+        self._panel.applied.connect(self._apply_cfg)
+        sc = QApplication.primaryScreen().availableGeometry()
+        px = self.x()-368 if self.x()>368 else self.x()+self.width()+8
+        py = max(sc.top(), min(self.y(), sc.bottom()-700))
+        self._panel.move(px, py); self._panel.show()
+
+    # ── SIGN OUT ────────────────────────────────
+    def _sign_out(self):
         if self._poller: self._poller.stop()
-        hotkey_mgr.stop()
-        token_mgr.revoke(); self.close(); _show_setup()
+        _hk.stop(); _tok.revoke(); self.close(); _do_setup()
 
-    # ── COLLAPSE ──
-    def _toggle_collapse(self):
-        self.collapsed = not self.collapsed
-        self._body.setVisible(not self.collapsed)
-        self._col_btn.setText("▸" if self.collapsed else "▾")
-        self.adjustSize()
-        s = dict(self._settings); s["x"] = self.x(); s["y"] = self.y(); save_settings(s)
+    # ── HOTKEYS ─────────────────────────────────
+    def _bind_hk(self):
+        s = self._cfg
+        _hk.register(s.get("hk_play",    "<ctrl>+<shift>+p"), self._do_play)
+        _hk.register(s.get("hk_next",    "<ctrl>+<shift>+n"), lambda: self._cmd("next"))
+        _hk.register(s.get("hk_prev",    "<ctrl>+<shift>+b"), lambda: self._cmd("previous"))
+        _hk.register(s.get("hk_collapse","<ctrl>+<shift>+m"), self.toggle_col)
+        _hk.register(s.get("hk_settings","<ctrl>+<shift>+s"), self.open_settings)
+        _hk.start(); self._update_tips()
 
-    # ── DRAG — sürükle & konum otomatik kaydedilir ──
+    def _update_tips(self):
+        s = self._cfg
+        def f(k, d):
+            return (s.get(k,d).replace("<ctrl>","Ctrl")
+                               .replace("<shift>","Shift")
+                               .replace("<alt>","Alt").upper())
+        pp  = f("hk_play",    "<ctrl>+<shift>+p")
+        nxt = f("hk_next",    "<ctrl>+<shift>+n")
+        prv = f("hk_prev",    "<ctrl>+<shift>+b")
+        col = f("hk_collapse","<ctrl>+<shift>+m")
+        stg = f("hk_settings","<ctrl>+<shift>+s")
+        ok  = "active ✓" if HAS_HK else "pynput not installed"
+        self._ply.setToolTip(f"Play / Pause  [{pp}]")
+        self._nxt.setToolTip(f"Next track  [{nxt}]")
+        self._prv.setToolTip(f"Previous track  [{prv}]")
+        self._col.setToolTip(f"Collapse / Expand  [{col}]")
+        self._set_btn.setToolTip(
+            f"Open settings  [{stg}]\n"
+            f"─────────────────────────\n"
+            f"Hotkeys ({ok}):\n"
+            f"  Play / Pause     {pp}\n"
+            f"  Next track       {nxt}\n"
+            f"  Previous track   {prv}\n"
+            f"  Collapse         {col}\n"
+            f"  Settings         {stg}"
+        )
+
+    # ── DRAG (skip buttons & sliders) ────────────
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            w = self.childAt(e.position().toPoint())
+            if not isinstance(w, (QPushButton, QSlider)):
+                self._drag = (e.globalPosition().toPoint()
+                              - self.frameGeometry().topLeft())
 
     def mouseMoveEvent(self, e):
-        if self._drag_pos and e.buttons() == Qt.MouseButton.LeftButton:
-            self.move(e.globalPosition().toPoint() - self._drag_pos)
+        if self._drag and e.buttons() == Qt.MouseButton.LeftButton:
+            self.move(e.globalPosition().toPoint() - self._drag)
 
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and self._drag_pos:
-            self._drag_pos = None
-            s = dict(self._settings); s["x"] = self.x(); s["y"] = self.y()
-            self._settings = s; save_settings(s)
+        if e.button() == Qt.MouseButton.LeftButton and self._drag:
+            self._drag = None
+            s = dict(self._cfg); s["x"]=self.x(); s["y"]=self.y()
+            self._cfg = s; save_cfg(s)
             if self._panel and self._panel.isVisible():
-                self._panel.update_pos(self.x(), self.y())
+                self._panel.sync_pos(self.x(), self.y())
 
-    # ── HELPERS ──
+    # ── HELPERS ─────────────────────────────────
     @staticmethod
-    def _fmt(ms):
-        s = int(ms / 1000); return f"{s//60}:{s%60:02d}"
-
+    def _ms(ms):
+        s = int(ms/1000); return f"{s//60}:{s%60:02d}"
     @staticmethod
-    def _elide(text, n):
-        return text if len(text) <= n else text[:n-1] + "…"
+    def _elide(t, n):
+        return t if len(t)<=n else t[:n-1]+"…"
 
-
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════
 #  APP ENTRY
-# ─────────────────────────────────────────────
-_app = _setup = _player = None
+# ═══════════════════════════════════════════════
+_app = _splash = _setup = _player = None
 
-def _show_setup():
+def _do_setup():
     global _setup
     _setup = SetupWindow()
-    _setup.login_success.connect(_on_login)
+    _setup.logged_in.connect(_on_login)
     _setup.show()
 
 def _on_login():
     global _player
     if _setup: _setup.close()
-    _player = PlayerOverlay(); _player.show()
+    _player = Player(); _player.show()
+
+def _after_splash():
+    global _player
+    if _tok.ok: _player = Player(); _player.show()
+    else: _do_setup()
 
 def main():
-    global _app
+    global _app, _splash
     _app = QApplication(sys.argv)
-    _app.setApplicationName("Spotify Mini Player")
+    _app.setApplicationName(APP)
+    _app.setWindowIcon(app_icon())
     _app.setQuitOnLastWindowClosed(False)
-    if token_mgr.has_token:
-        global _player
-        _player = PlayerOverlay(); _player.show()
-    else:
-        _show_setup()
+    _splash = Splash()
+    _splash.done.connect(_after_splash)
+    _splash.show()
     sys.exit(_app.exec())
 
 if __name__ == "__main__":

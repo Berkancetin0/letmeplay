@@ -431,7 +431,9 @@ class Splash(QWidget):
         sc = QApplication.primaryScreen().geometry()
         self.move(sc.center()-QPoint(160,110))
         self._a = 0; self._phase = 0; self._ticks = 0
-        t = QTimer(self); t.timeout.connect(self._tick); t.start(14)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(14)
 
     def _tick(self):
         self._ticks += 1
@@ -442,7 +444,11 @@ class Splash(QWidget):
             if self._ticks > 90: self._phase = 2
         else:
             self._a = max(0, self._a-8)
-            if self._a == 0: self.done.emit(); self.close(); return
+            if self._a == 0:
+                self._timer.stop()
+                self.close()
+                self.done.emit()
+                return
         self.update()
 
     def paintEvent(self, _):

@@ -3,57 +3,125 @@ name: Build Windows EXE
 on:
   push:
     tags:
-      - "v*"          # v1.0, v1.2.3 gibi tag'lerde tetiklenir
-  workflow_dispatch:  # Manuel de çalıştırılabilir
+      - "v*"
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Python kur
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Bağımlılıkları yükle
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: EXE derle
+      - name: Generate icon
+        run: |
+          python -c "
+          import struct,zlib,math
+          def c(v): return max(0,min(255,int(v)))
+          def png(size):
+              BG=(8,12,10);A=(30,215,96);A2=(130,240,160)
+              cx=cy=size/2;r=size/2;rows=[]
+              for y in range(size):
+                  row=[]
+                  for x in range(size):
+                      dx,dy=x-cx,y-cy;dist=math.sqrt(dx*dx+dy*dy)
+                      if dist>=r: row+=[0,0,0,0];continue
+                      t=(dist/r)*.5;R=c(BG[0]+40*t);G=c(BG[1]+50*t);B=c(BG[2]+30*t)
+                      ring=r*.80;rw=r*.08
+                      if abs(dist-ring)<rw:
+                          b2=1.0-abs(dist-ring)/rw
+                          R=c(R*(1-b2*.8)+A[0]*b2*.8);G=c(G*(1-b2*.8)+A[1]*b2*.8);B=c(B*(1-b2*.8)+A[2]*b2*.8)
+                      ts=r*.38;rx=(x-cx)+ts*.06;ry=y-cy;my=ts*(.60+rx*.52/ts) if ts>0 else 0
+                      if -ts*.54<=rx<=ts*.64 and abs(ry)<=my:
+                          p2=c((rx+ts*.54)/(ts*1.18)*255)
+                          R=c(A[0]*(1-p2/255*.1)+A2[0]*(p2/255*.1));G=c(A[1]*(1-p2/255*.05));B=c(A[2]*(1-p2/255*.2))
+                      alpha=c(255*(r-dist)) if dist>r-1.5 else 255
+                      row+=[c(R),c(G),c(B),alpha]
+                  rows.append(row)
+              def ck(n,d): crc=zlib.crc32(n+d)&0xffffffff;return struct.pack('>I',len(d))+n+d+struct.pack('>I',crc)
+              p=b'\x89PNG\r\n\x1a\n'+ck(b'IHDR',struct.pack('>IIBBBBB',size,size,8,6,0,0,0))
+              raw=b''.join(b'\x00'+bytes(r) for r in rows);p+=ck(b'IDAT',zlib.compress(raw,6))+ck(b'IEND',b'');return p
+          sizes=[16,32,48,256];pngs={s:png(s) for s in sizes}
+          num=len(sizes);hdr=struct.pack('<HHH',0,1,num);off=6+num*16;dirs=b''
+          for s in sizes:
+              w=s if s<256 else 0;dirs+=struct.pack('<BBBBHHII',w,w,0,0,1,32,len(pngs[s]),off);off+=len(pngs[s])
+          ico=hdr+dirs+b''.join(pngs[s] for s in sizes)
+          open('icon.ico','wb').write(ico);print('icon.ico generated OK')
+          "
+
+      - name: Build EXE with PyInstaller
         run: |
           pyinstaller `
             --onefile `
             --windowed `
-            --name "SpotifyMiniPlayer" `
+            --name "LetMePlay" `
+            --icon "icon.ico" `
             --hidden-import PyQt6.QtCore `
             --hidden-import PyQt6.QtGui `
             --hidden-import PyQt6.QtWidgets `
             --hidden-import requests `
+            --hidden-import pynput `
+            --hidden-import pynput.keyboard `
+            --hidden-import pynput._util.win32 `
             main.py
 
-      - name: Release oluştur ve EXE yükle
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/SpotifyMiniPlayer.exe
-          name: "Spotify Mini Player ${{ github.ref_name }}"
+          files: dist/LetMePlay.exe
+          name: "Let Me Play ${{ github.ref_name }}"
           body: |
-            ## 🎮 Spotify Mini Player ${{ github.ref_name }}
+            ## 🎮 Let Me Play ${{ github.ref_name }}
 
-            Oyun oynarken müziğini alt-tab atmadan kontrol et.
+            Control your music without alt-tabbing out of your game.
 
-            ### İndir
-            👇 Aşağıdaki **SpotifyMiniPlayer.exe** dosyasına tıkla
+            ---
 
-            ### Kurulum
-            1. [Spotify Dashboard](https://developer.spotify.com/dashboard) → Create App → Redirect URI: `http://localhost:8888/callback`
-            2. EXE'yi çalıştır → Client ID & Secret gir → Giriş Yap
-            3. Tarayıcıda izin ver → Player açılır!
+            ### ⬇️ Download
+            Click **LetMePlay.exe** below — no installation required.
 
-            ### Gereksinimler
-            - Windows 10/11
-            - Aktif Spotify hesabı (ücretsiz de çalışır)
+            > **Windows Defender warning?**
+            > Click "More info" → "Run anyway". This is normal for unsigned apps.
+
+            ---
+
+            ### 🚀 First-time setup (one-time, ~2 minutes)
+
+            1. Go to [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard) → **Create App**
+            2. Set Redirect URI to: `http://127.0.0.1:8888/callback`
+            3. Copy your **Client ID** and **Client Secret**
+            4. Run `LetMePlay.exe` → paste them in → **Sign In**
+            5. Approve in your browser → player opens!
+
+            Next time you launch, it opens directly — no login needed.
+
+            ---
+
+            ### ⌨️ Default keyboard shortcuts (work in-game)
+
+            | Shortcut | Action |
+            |---|---|
+            | `Ctrl + Shift + P` | Play / Pause |
+            | `Ctrl + Shift + N` | Next track |
+            | `Ctrl + Shift + B` | Previous track |
+            | `Ctrl + Shift + M` | Collapse / Expand |
+            | `Ctrl + Shift + S` | Open settings |
+
+            Shortcuts can be changed in **⚙ Settings**.
+
+            ---
+
+            ### 💻 Requirements
+            - Windows 10 / 11
+            - Active Spotify account (free works too)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

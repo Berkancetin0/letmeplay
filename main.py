@@ -113,6 +113,11 @@ def _svg_pix(svg_body: str, size: int, color: str = "#e4f0e8") -> QPixmap:
     return pix
 
 # SVG path data (Material Design icons)
+# All icon colors must be hex strings — rgba() doesn't work in SVG fill
+ICO_DIM   = "#7a9982"   # muted for prev/next
+ICO_MUTED = "#4a6650"   # very muted for shuffle/repeat off
+ICO_TEXT  = "#c8e0cc"   # bright for hover
+
 ICO = {
     "play":     "M8 5v14l11-7z",
     "pause":    "M6 19h4V5H6v14zm8-14v14h4V5h-4z",
@@ -950,7 +955,7 @@ class Player(QWidget):
         self._eq = EQBars(); self._eq.setFixedSize(26,16); tl.addWidget(self._eq)
 
         # Collapse button — SVG chevron, no emoji
-        self._col_btn = IconBtn("collapse", 26, color=TEXT_MUTED, hover_color=TEXT)
+        self._col_btn = IconBtn("collapse", 26, color="#5a7a60", hover_color="#c8e0cc")
         self._col_btn.clicked.connect(self.toggle_col)
         tl.addWidget(self._col_btn)
         lay.addWidget(top)
@@ -968,11 +973,11 @@ class Player(QWidget):
 
         # controls row
         cr = QHBoxLayout(); cr.setSpacing(2)
-        self._sh  = IconBtn("shuffle", 32, TEXT_MUTED, TEXT)
-        self._prv = IconBtn("prev",    32, TEXT_DIM,   TEXT)
+        self._sh  = IconBtn("shuffle", 32, "#4a6650", "#c8e0cc")
+        self._prv = IconBtn("prev",    32, "#7a9982", "#c8e0cc")
         self._ply = PlayBtn()
-        self._nxt = IconBtn("next",    32, TEXT_DIM,   TEXT)
-        self._rep = IconBtn("repeat",  32, TEXT_MUTED, TEXT)
+        self._nxt = IconBtn("next",    32, "#7a9982", "#c8e0cc")
+        self._rep = IconBtn("repeat",  32, "#4a6650", "#c8e0cc")
         self._sh.clicked.connect(self._do_shuffle)
         self._prv.clicked.connect(lambda: self._cmd("previous"))
         self._ply.clicked.connect(self._do_play)
@@ -984,7 +989,7 @@ class Player(QWidget):
 
         # volume row — SVG volume icon
         vr = QHBoxLayout(); vr.setSpacing(8)
-        vol_ico = QLabel(); vol_ico.setPixmap(ico("vol_lo",16,TEXT_MUTED)); vol_ico.setFixedSize(16,16)
+        vol_ico = QLabel(); vol_ico.setPixmap(ico("vol_lo",16,"#4a6650")); vol_ico.setFixedSize(16,16)
         self._vol = QSlider(Qt.Orientation.Horizontal)
         self._vol.setRange(0,100); self._vol.setValue(70); self._vol.setFixedHeight(16)
         self._vol.setStyleSheet(f"""
@@ -1072,6 +1077,11 @@ class Player(QWidget):
         )
         p.end(); self._art.setPixmap(px)
 
+    def _is_in_drag_zone(self, pos) -> bool:
+        """Only allow drag from the top bar area, not body or strip."""
+        top_bar_h = 60
+        return pos.y() <= top_bar_h
+
     # ── POLLING ──────────────────────────────────
     def _start_poll(self):
         self._poller = Poller()
@@ -1155,20 +1165,29 @@ class Player(QWidget):
 
     # ── SETTINGS ─────────────────────────────────
     def open_settings(self):
-        # If already open, just raise it
-        if self._panel is not None and self._panel.isVisible():
-            self._panel.raise_()
-            self._panel.activateWindow()
-            return
-        s=dict(self._cfg); s["x"]=self.x(); s["y"]=self.y()
+        # Guard: never open twice
+        if self._panel is not None:
+            try:
+                if self._panel.isVisible():
+                    self._panel.raise_()
+                    self._panel.activateWindow()
+                    return
+            except RuntimeError:
+                self._panel = None  # C++ object deleted
+
+        s = dict(self._cfg); s["x"] = self.x(); s["y"] = self.y()
         self._panel = SettingsPanel(s)
         self._panel.applied.connect(self._apply_cfg)
-        # destroyed when closed so we can open again later
-        self._panel.destroyed.connect(lambda: setattr(self,"_panel",None))
+        self._panel.finished_signal = None  # just in case
+        # Clear ref when window closes
+        def _on_close():
+            self._panel = None
+        self._panel.destroyed.connect(lambda _=None: _on_close())
         sc = QApplication.primaryScreen().availableGeometry()
         px = self.x()-368 if self.x()>368 else self.x()+self.width()+8
         py = max(sc.top(), min(self.y(), sc.bottom()-700))
-        self._panel.move(px,py); self._panel.show()
+        self._panel.move(px, py)
+        self._panel.show()
 
     # ── SIGN OUT ─────────────────────────────────
     def _sign_out(self):
@@ -1191,8 +1210,8 @@ class Player(QWidget):
             return (s.get(k,d).replace("<ctrl>","Ctrl")
                                .replace("<shift>","Shift")
                                .replace("<alt>","Alt").upper())
-        pp=f("hk_play","<ctrl>+<shift>+p");nxt=f("hk_next","<ctrl>+<shift>+n")
-        prv=f("hk_prev","<ctrl>+<shift>+b");col=f("hk_collapse","<ctrl>+<shift>+m")
+        pp=f("hk_play","<ctrl>+<shift>+p"); nxt=f("hk_next","<ctrl>+<shift>+n")
+        prv=f("hk_prev","<ctrl>+<shift>+b"); col=f("hk_collapse","<ctrl>+<shift>+m")
         stg=f("hk_settings","<ctrl>+<shift>+s"); ok="active" if HAS_HK else "pynput not installed"
         self._ply.setToolTip(f"Play / Pause  [{pp}]")
         self._nxt.setToolTip(f"Next  [{nxt}]")
@@ -1203,12 +1222,16 @@ class Player(QWidget):
             f"  Play/Pause  {pp}\n  Next        {nxt}\n  Previous    {prv}\n"
             f"  Collapse    {col}\n  Settings    {stg}")
 
-    # ── DRAG (skip buttons & sliders) ────────────
+    # ── DRAG — only from top bar area ────────────
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            w = self.childAt(e.position().toPoint())
-            if not isinstance(w, (QPushButton, QSlider, IconBtn, PlayBtn)):
-                self._drag = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            # Only drag from the top-bar zone (first 60px of card)
+            local = self._card.mapFrom(self, e.position().toPoint())
+            if self._is_in_drag_zone(local):
+                # But not if clicking the collapse button
+                w = self.childAt(e.position().toPoint())
+                if not isinstance(w, (QPushButton, IconBtn, PlayBtn)):
+                    self._drag = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, e):
         if self._drag and e.buttons() == Qt.MouseButton.LeftButton:
@@ -1217,10 +1240,14 @@ class Player(QWidget):
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and self._drag:
             self._drag = None
-            s=dict(self._cfg); s["x"]=self.x(); s["y"]=self.y()
-            self._cfg=s; save_cfg(s)
-            if self._panel and self._panel.isVisible():
-                self._panel.sync_pos(self.x(),self.y())
+            s = dict(self._cfg); s["x"] = self.x(); s["y"] = self.y()
+            self._cfg = s; save_cfg(s)
+            if self._panel is not None:
+                try:
+                    if self._panel.isVisible():
+                        self._panel.sync_pos(self.x(), self.y())
+                except RuntimeError:
+                    self._panel = None
 
     @staticmethod
     def _ms(ms): s=int(ms/1000); return f"{s//60}:{s%60:02d}"

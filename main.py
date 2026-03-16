@@ -37,7 +37,7 @@ from PyQt6.QtGui import (
 # ─────────────────────────────────────────────
 CLIENT_ID     = "SENIN_CLIENT_ID"
 CLIENT_SECRET = "SENIN_CLIENT_SECRET"
-REDIRECT_URI  = "http://localhost:8888/callback"
+REDIRECT_URI  = "http://127.0.0.1:8888/callback"
 SCOPES        = "user-read-currently-playing user-read-playback-state user-modify-playback-state"
 PORT          = 8888
 CONFIG_FILE   = Path.home() / ".spotify_mini_player.json"
@@ -494,7 +494,7 @@ class SetupWindow(QWidget):
         bl.addWidget(hl)
         for num, txt in [
             ("1", "developer.spotify.com/dashboard → Create App"),
-            ("2", "Redirect URI: http://localhost:8888/callback"),
+            ("2", "Redirect URI: http://127.0.0.1:8888/callback"),
             ("3", "Client ID & Secret'ı aşağıya gir"),
             ("4", "Giriş Yap → tarayıcıda izin ver → hazır!"),
         ]:

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec
+.spotify_mini_player.json
+*.egg-info/
+.venv/
+venv/

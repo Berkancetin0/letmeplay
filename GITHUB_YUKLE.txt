@@ -1,0 +1,79 @@
+═══════════════════════════════════════════════════
+  GitHub'a Yükleme Rehberi (adım adım)
+═══════════════════════════════════════════════════
+
+ADIM 1 — GitHub hesabı aç (varsa atla)
+────────────────────────────────────────
+https://github.com/signup
+
+
+ADIM 2 — Yeni repo oluştur
+────────────────────────────
+1. github.com → sağ üst "+" → "New repository"
+2. Repository name: spotify-mini-player
+3. Description: Gaming overlay for Spotify
+4. Public seç (indirilebilir olsun diye)
+5. README, .gitignore, license EKLEME (zaten var)
+6. "Create repository" tıkla
+
+
+ADIM 3 — Git kur (yoksa)
+──────────────────────────
+https://git-scm.com/download/win
+Kurulumda hep "Next" yeterli.
+
+
+ADIM 4 — Dosyaları yükle
+──────────────────────────
+Bu klasörde terminal/cmd aç ve sırayla çalıştır:
+
+  git init
+  git add .
+  git commit -m "ilk yükleme"
+  git branch -M main
+  git remote add origin https://github.com/KULLANICI_ADIN/spotify-mini-player.git
+  git push -u origin main
+
+(KULLANICI_ADIN kısmını kendi GitHub kullanıcı adınla değiştir)
+
+
+ADIM 5 — İlk Release oluştur (EXE otomatik derlenir)
+──────────────────────────────────────────────────────
+GitHub'daki repona git, sonra:
+
+  Yol A — GitHub sitesinden:
+  1. Sağ tarafta "Releases" → "Create a new release"
+  2. "Choose a tag" → "v1.0" yaz → "Create new tag"
+  3. Title: "Spotify Mini Player v1.0"
+  4. "Publish release" tıkla
+
+  Yol B — Git komutuyla:
+  git tag v1.0
+  git push origin v1.0
+
+→ GitHub Actions otomatik başlar (~3-4 dakika)
+→ Actions sekmesinden build'i izleyebilirsin
+→ Bitince Releases'ta SpotifyMiniPlayer.exe görünür!
+
+
+ADIM 6 — İndirme linki
+────────────────────────
+https://github.com/KULLANICI_ADIN/spotify-mini-player/releases/latest
+
+Bu linki paylaşabilirsin. Her zaman en son sürümü gösterir.
+
+
+GÜNCELLEME YAYINLAMA (sonraki sürümler)
+────────────────────────────────────────
+Kod değişikliği yaptıktan sonra:
+
+  git add .
+  git commit -m "yeni özellik açıklaması"
+  git push
+  git tag v1.1
+  git push origin v1.1
+
+→ GitHub Actions otomatik yeni EXE derler ve yayınlar.
+
+
+═══════════════════════════════════════════════════

@@ -1,0 +1,59 @@
+name: Build Windows EXE
+
+on:
+  push:
+    tags:
+      - "v*"          # v1.0, v1.2.3 gibi tag'lerde tetiklenir
+  workflow_dispatch:  # Manuel de çalıştırılabilir
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bağımlılıkları yükle
+        run: pip install -r requirements.txt
+
+      - name: EXE derle
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name "SpotifyMiniPlayer" `
+            --hidden-import PyQt6.QtCore `
+            --hidden-import PyQt6.QtGui `
+            --hidden-import PyQt6.QtWidgets `
+            --hidden-import requests `
+            main.py
+
+      - name: Release oluştur ve EXE yükle
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SpotifyMiniPlayer.exe
+          name: "Spotify Mini Player ${{ github.ref_name }}"
+          body: |
+            ## 🎮 Spotify Mini Player ${{ github.ref_name }}
+
+            Oyun oynarken müziğini alt-tab atmadan kontrol et.
+
+            ### İndir
+            👇 Aşağıdaki **SpotifyMiniPlayer.exe** dosyasına tıkla
+
+            ### Kurulum
+            1. [Spotify Dashboard](https://developer.spotify.com/dashboard) → Create App → Redirect URI: `http://localhost:8888/callback`
+            2. EXE'yi çalıştır → Client ID & Secret gir → Giriş Yap
+            3. Tarayıcıda izin ver → Player açılır!
+
+            ### Gereksinimler
+            - Windows 10/11
+            - Aktif Spotify hesabı (ücretsiz de çalışır)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -71,6 +71,7 @@ DEFAULT_CFG = {
     "hk_prev":     "<ctrl>+<shift>+b",
     "hk_collapse": "<ctrl>+<shift>+m",
     "hk_settings": "<ctrl>+<shift>+s",
+    "hk_show":     "<ctrl>+<shift>+l",  # bring player to front
 }
 
 CLIENT_ID     = "SENIN_CLIENT_ID"
@@ -254,6 +255,8 @@ class Poller(QThread):
                 "pos":     d.get("progress_ms",0),
                 "dur":     item.get("duration_ms",1),
                 "playing": d.get("is_playing",False),
+                "shuffle": d.get("shuffle_state", False),
+                "repeat":  d.get("repeat_state", "off"),
             })
         except Exception: pass
     def stop(self): self._on=False
@@ -659,7 +662,8 @@ class SettingsPanel(QWidget):
         inp_s=(f"background:{CARD};border:1px solid rgba(30,215,96,0.18);"
                f"border-radius:6px;color:{T_HI};font-size:11px;padding:7px 10px;font-family:Consolas;")
         for key,lbl in [("hk_play","Play / Pause"),("hk_next","Next track"),
-                         ("hk_prev","Previous track"),("hk_collapse","Collapse"),("hk_settings","Open settings")]:
+                         ("hk_prev","Previous track"),("hk_collapse","Collapse"),
+                         ("hk_show","Show player"),("hk_settings","Open settings")]:
             row=QHBoxLayout(); row.setSpacing(10)
             lb=QLabel(lbl); lb.setFixedWidth(112); lb.setStyleSheet(f"font-size:11px;color:{T_MID};")
             inp=QLineEdit(self._cfg.get(key,"")); inp.setStyleSheet(inp_s); inp.setEnabled(HAS_HK)
@@ -725,8 +729,10 @@ class Player(QWidget):
         self._ticker=QTimer(self); self._ticker.timeout.connect(self._tick); self._ticker.start(1000)
         self._vol_db=QTimer(self); self._vol_db.setSingleShot(True); self._vol_db.timeout.connect(self._send_vol)
 
-        # Force always-on-top every 2 seconds — beats fullscreen games
-        self._top_timer=QTimer(self); self._top_timer.timeout.connect(self._force_top); self._top_timer.start(2000)
+        # Force always-on-top every 500ms via Windows API
+        self._top_timer=QTimer(self)
+        self._top_timer.timeout.connect(self._force_top)
+        self._top_timer.start(500)
 
     def _setup_win(self):
         self.setWindowTitle(APP); self.setWindowIcon(app_icon())
@@ -906,6 +912,9 @@ class Player(QWidget):
             self._status.setText("idle"); self._playing=False; self._upd_play(); return
         self._title.setText(self._elide(d["name"],22)); self._artist.setText(self._elide(d["artist"],26))
         self._cur=d["pos"]; self._dur=d["dur"]; self._playing=d["playing"]
+        # sync shuffle/repeat state from Spotify
+        self._sh.set_active(d.get("shuffle", False))
+        self._rep.set_active(d.get("repeat", "off") != "off")
         self._upd_play(); self._upd_prog(); self._status.setText("connected")
         art=d.get("art")
         if art and art!=self._art_url:
@@ -938,12 +947,20 @@ class Player(QWidget):
         QTimer.singleShot(450,self._poller.poll)
 
     def _do_shuffle(self):
-        on=not self._sh._is_on; self._sh.set_active(on)
-        threading.Thread(target=sp,args=("PUT",f"/shuffle?state={str(on).lower()}"),daemon=True).start()
+        on = not self._sh._is_on
+        self._sh.set_active(on)
+        threading.Thread(
+            target=sp, args=("PUT", f"/shuffle?state={str(on).lower()}"),
+            daemon=True
+        ).start()
 
     def _do_repeat(self):
-        on=not self._rep._is_on; self._rep.set_active(on)
-        threading.Thread(target=sp,args=("PUT",f"/repeat?state={'context' if on else 'off'}"),daemon=True).start()
+        on = not self._rep._is_on
+        self._rep.set_active(on)
+        threading.Thread(
+            target=sp, args=("PUT", f"/repeat?state={'context' if on else 'off'}"),
+            daemon=True
+        ).start()
 
     def _on_vol(self,v): self._vp.setText(f"{v}%"); self._vol_db.start(260)
     def _send_vol(self):
@@ -954,20 +971,32 @@ class Player(QWidget):
         threading.Thread(target=sp,args=("PUT",f"/seek?position_ms={pos}"),daemon=True).start()
 
     def _force_top(self):
-        """Windows API ile pencereyi en üste zorla — fullscreen oyunlarda da çalışır."""
+        """Windows SetWindowPos HWND_TOPMOST — works against most games."""
         try:
             import ctypes
-            HWND_TOPMOST   = -1
-            SWP_NOMOVE     = 0x0002
-            SWP_NOSIZE     = 0x0001
-            SWP_NOACTIVATE = 0x0010
             hwnd = int(self.winId())
             ctypes.windll.user32.SetWindowPos(
-                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                hwnd,
+                -1,      # HWND_TOPMOST
+                0, 0, 0, 0,
+                0x0002 | 0x0001 | 0x0010  # NOMOVE | NOSIZE | NOACTIVATE
             )
         except Exception:
-            pass  # Non-Windows veya hata — sessizce geç
+            pass
+
+    def bring_forward(self):
+        """Hotkey ile çağrılır — pencereyi öne getirir ve gösterir."""
+        self._force_top()
+        self.show()
+        self.raise_()
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            # NOACTIVATE olmadan çağır — gerçekten öne gelsin
+            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001)
+            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        except Exception:
+            pass
 
     # ── COLLAPSE ────────────────────────────────
     def toggle_col(self):
@@ -1010,6 +1039,7 @@ class Player(QWidget):
         _hk.register(s.get("hk_prev",    "<ctrl>+<shift>+b"), lambda: self._cmd("previous"))
         _hk.register(s.get("hk_collapse","<ctrl>+<shift>+m"), self.toggle_col)
         _hk.register(s.get("hk_settings","<ctrl>+<shift>+s"), self.open_settings)
+        _hk.register(s.get("hk_show",    "<ctrl>+<shift>+l"), self.bring_forward)
         _hk.start(); self._update_tips()
 
     def _update_tips(self):
@@ -1017,14 +1047,16 @@ class Player(QWidget):
         def f(k,d): return s.get(k,d).replace("<ctrl>","Ctrl").replace("<shift>","Shift").replace("<alt>","Alt").upper()
         pp=f("hk_play","<ctrl>+<shift>+p"); nxt=f("hk_next","<ctrl>+<shift>+n")
         prv=f("hk_prev","<ctrl>+<shift>+b"); col=f("hk_collapse","<ctrl>+<shift>+m")
-        stg=f("hk_settings","<ctrl>+<shift>+s"); ok="active" if HAS_HK else "pynput not installed"
+        stg=f("hk_settings","<ctrl>+<shift>+s"); shw=f("hk_show","<ctrl>+<shift>+l")
+        ok="active" if HAS_HK else "pynput not installed"
         self._ply.setToolTip(f"Play / Pause  [{pp}]")
         self._nxt.setToolTip(f"Next  [{nxt}]"); self._prv.setToolTip(f"Previous  [{prv}]")
         self._col_btn.setToolTip(f"Collapse / Expand  [{col}]")
         self._set_btn.setToolTip(
             f"Settings  [{stg}]\n─────────────────\nHotkeys ({ok}):\n"
-            f"  Play/Pause  {pp}\n  Next        {nxt}\n  Previous    {prv}\n"
-            f"  Collapse    {col}\n  Settings    {stg}")
+            f"  Play/Pause   {pp}\n  Next         {nxt}\n  Previous     {prv}\n"
+            f"  Collapse     {col}\n  Show player  {shw}\n  Settings     {stg}"
+        )
 
     # ── DRAG — only from top bar ─────────────────
     # We use the _topbar widget's mouse events directly to avoid

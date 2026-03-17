@@ -725,11 +725,19 @@ class Player(QWidget):
         self._ticker=QTimer(self); self._ticker.timeout.connect(self._tick); self._ticker.start(1000)
         self._vol_db=QTimer(self); self._vol_db.setSingleShot(True); self._vol_db.timeout.connect(self._send_vol)
 
+        # Force always-on-top every 2 seconds — beats fullscreen games
+        self._top_timer=QTimer(self); self._top_timer.timeout.connect(self._force_top); self._top_timer.start(2000)
+
     def _setup_win(self):
         self.setWindowTitle(APP); self.setWindowIcon(app_icon())
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint|
-                            Qt.WindowType.WindowStaysOnTopHint|Qt.WindowType.Tool)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool |
+            Qt.WindowType.X11BypassWindowManagerHint  # extra force on some systems
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)  # don't steal focus
 
     def _apply_cfg(self,cfg,first=False):
         self._cfg=cfg
@@ -944,6 +952,22 @@ class Player(QWidget):
     def _seek(self,pct):
         pos=int(pct*self._dur); self._cur=pos; self._upd_prog()
         threading.Thread(target=sp,args=("PUT",f"/seek?position_ms={pos}"),daemon=True).start()
+
+    def _force_top(self):
+        """Windows API ile pencereyi en üste zorla — fullscreen oyunlarda da çalışır."""
+        try:
+            import ctypes
+            HWND_TOPMOST   = -1
+            SWP_NOMOVE     = 0x0002
+            SWP_NOSIZE     = 0x0001
+            SWP_NOACTIVATE = 0x0010
+            hwnd = int(self.winId())
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+            )
+        except Exception:
+            pass  # Non-Windows veya hata — sessizce geç
 
     # ── COLLAPSE ────────────────────────────────
     def toggle_col(self):

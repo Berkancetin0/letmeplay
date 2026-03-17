@@ -68,6 +68,8 @@ jobs:
             --hidden-import PyQt6.QtCore `
             --hidden-import PyQt6.QtGui `
             --hidden-import PyQt6.QtWidgets `
+            --hidden-import PyQt6.QtSvg `
+            --hidden-import PyQt6.QtSvgWidgets `
             --hidden-import requests `
             --hidden-import pynput `
             --hidden-import pynput.keyboard `
